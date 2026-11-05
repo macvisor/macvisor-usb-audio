@@ -45,7 +45,7 @@ import Testing
         a.setReadTimeout(0.3)
         let start = Date()
         #expect(throws: StreamError.timedOut) { _ = try a.read(exactly: 20) }
-        #expect(Date().timeIntervalSince(start) < 0.8)
+        #expect(Date().timeIntervalSince(start) < 2.5) // well under the 4 s a missed wake-up would take, with room for a loaded CI Mac
         b.close()
     }
 

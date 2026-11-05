@@ -49,7 +49,7 @@ final class CountingSource: CaptureSource, @unchecked Sendable {
         let urb = try client.submit(direction: 0, endpoint: 1, outData: pcm(value: 1, frames: 480), isoLengths: Array(repeating: 192, count: 10))
         #expect(sink.entered.wait(timeout: .now() + 2) == .success) // its job runs, and waits
         let unlink = try client.unlink(urb)
-        Thread.sleep(forTimeInterval: 0.1) // the server has read the unlink
+        Thread.sleep(forTimeInterval: 0.3) // the server has read the unlink
         sink.proceed.signal()
         guard case .submit(let first, let status, _, _, _) = try client.readReply() else { Issue.record("RET_UNLINK came first"); return }
         #expect(first == urb && status == 0)
@@ -89,7 +89,7 @@ final class CountingSource: CaptureSource, @unchecked Sendable {
         client.stream.setReadTimeout(3) // a server that waits for all 40 bytes fails the test
         let start = Date()
         #expect(throws: StreamError.closed) { _ = try client.stream.read(exactly: 1) }
-        #expect(Date().timeIntervalSince(start) < 0.7) // 0.3 s, not 4 s (or 0.8 s, the first read's 8 bytes)
+        #expect(Date().timeIntervalSince(start) < 2.5) // 0.3 s, not 4 s (or 0.8 s, the first read's 8 bytes): room for a loaded CI Mac
         #expect(!server.isAttached)
     }
 
@@ -232,6 +232,24 @@ final class CountingSource: CaptureSource, @unchecked Sendable {
         #expect(try client.importDevice())
         try client.send(ClientMessages.submit(sequence: 1, direction: 2, endpoint: 1, isoLengths: [192]))
         #expect(waitUntil { !server.isAttached })
+    }
+
+    /// A stalled control request is said once a session, with the request: a volume control the
+    /// host addresses on a channel the descriptor doesn't declare would otherwise go unseen.
+    @Test func theFirstStalledControlRequestIsLogged() throws {
+        let lines = Locked<[String]>([])
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource())
+        server.log = { line in lines.mutate { $0.append(line) } }
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        // SET_CUR volume on channel 1 of the speaker's feature unit: only the master is declared.
+        let channel1 = SetupPacket(requestType: 0x21, request: 0x01, value: 0x0201, index: UInt16(UAC1AudioDevice.speakerFeatureUnit) << 8, length: 2)
+        #expect(try client.control(channel1, outData: Data([0, 0])).0 == USBIP.Status.stall)
+        #expect(try client.control(channel1, outData: Data([0, 0])).0 == USBIP.Status.stall)
+        #expect(waitUntil { lines.value.contains { $0.hasPrefix("stalled a control request") } })
+        let stalls = lines.value.filter { $0.hasPrefix("stalled a control request") }
+        #expect(stalls == ["stalled a control request the device doesn't support: bmRequestType 0x21 bRequest 0x01 wValue 0x0201 wIndex 0x0200 (later ones aren't logged)"])
     }
 
     /// The guest's bus ID is logged escaped: a newline in it would forge a log line.

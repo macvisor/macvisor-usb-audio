@@ -162,6 +162,10 @@ public final class USBAudioServer: @unchecked Sendable {
         var steering: DispatchSourceTimer?
         /// Whether this session already logged a refused URB (the first is said, not the rest).
         var saidRefused = false
+        /// Whether this session already logged a stalled control request (the first is said, not the
+        /// rest): a host asking for something the device doesn't declare, such as a volume control on a
+        /// channel other than the master, would otherwise go unseen.
+        var saidStalled = false
 
         func send(_ data: Data) {
             writeLock.lock()
@@ -253,7 +257,8 @@ public final class USBAudioServer: @unchecked Sendable {
         if urb.endpoint == 0 {
             // Control transfers complete at once, in order (the host serialises them); a session that
             // has ended stalls them.
-            switch s.ifLive({ device.handleControl(SetupPacket(urb.setup), outData: urb.outData) }) ?? .stall {
+            let setup = SetupPacket(urb.setup)
+            switch s.ifLive({ device.handleControl(setup, outData: urb.outData) }) ?? .stall {
             case .data(let bytes):
                 // IN data: at most wLength (the device cut it there) and the host's buffer.
                 let isIn = urb.direction == .in
@@ -262,6 +267,13 @@ public final class USBAudioServer: @unchecked Sendable {
                                                actualLength: isIn ? UInt32(data.count) : UInt32(urb.outData.count),
                                                startFrame: 0, isoPackets: nil, data: data))
             case .stall:
+                // Hosts probe for what a device lacks (a qualifier descriptor, say), so a stall is no
+                // error: the first one is said, for when a control (volume, mute) stops working.
+                if !s.saidStalled {
+                    s.saidStalled = true
+                    log?(String(format: "stalled a control request the device doesn't support: bmRequestType 0x%02X bRequest 0x%02X wValue 0x%04X wIndex 0x%04X (later ones aren't logged)",
+                                setup.requestType, setup.request, setup.value, setup.index))
+                }
                 s.send(USBIP.encodeSubmitReply(sequence: urb.sequence, status: USBIP.Status.stall, actualLength: 0,
                                                startFrame: 0, isoPackets: nil))
             }
