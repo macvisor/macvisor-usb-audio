@@ -208,10 +208,20 @@ final class CountingSource: CaptureSource, @unchecked Sendable {
         startServing(server, client)
         try client.send(ClientMessages.operation(0x8003, busID: "1-1"))
         client.close()
-        #expect(waitUntil { !server.isAttached })
-        let next = TestClient()
-        startServing(server, next)
-        #expect(try next.importDevice())
+        // The device is free once the server has seen the client go, whenever it took the import: a
+        // check of isAttached alone could pass before the import was taken (a slow CI Mac), so a new
+        // client tries until its import is accepted.
+        var imported = false
+        for _ in 0 ..< 60 where !imported {
+            let next = TestClient()
+            startServing(server, next)
+            imported = (try? next.importDevice()) == true
+            if !imported {
+                next.close()
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        #expect(imported)
     }
 
     @Test func controlInRepliesFitTheHostsBuffer() throws {
