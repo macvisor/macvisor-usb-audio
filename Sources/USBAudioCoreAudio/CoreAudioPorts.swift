@@ -25,8 +25,13 @@ import USBAudioDevice
 /// a row); in the idle window after a stream it just stops. An engine that fails to start is tried
 /// again after a growing pause (`StartBackoff`), not at every URB.
 public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
-    public var log: (@Sendable (String) -> Void)?
+    public var log: (@Sendable (String) -> Void)? {
+        get { logLock.withLock { logHandler } }
+        set { logLock.withLock { logHandler = newValue } }
+    }
 
+    private let logLock = NSLock()
+    private var logHandler: (@Sendable (String) -> Void)?
     private let ring: StereoRing
     private let idleStop: TimeInterval
     private let makeOutput: MakePlaybackOutput
@@ -259,7 +264,10 @@ struct StartBackoff {
 /// same path as a retry, so a paused VM doesn't keep the Mac's microphone open. A freed
 /// CoreAudioCapture closes it at once.
 public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
-    public var log: (@Sendable (String) -> Void)?
+    public var log: (@Sendable (String) -> Void)? {
+        get { lock.withLock { logHandler } }
+        set { lock.withLock { logHandler = newValue } }
+    }
 
     /// A second: room for the tap's 100 ms buffers and what the trim keeps around them.
     private let ring = StereoRing(capacitySeconds: 1)
@@ -276,10 +284,11 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     /// While the microphone is open: closes it when the host stops asking.
     private var watchdog: DispatchSourceTimer?
     /// Shared with the server's thread: when a start is due (the host records, no microphone is open),
-    /// and when the host last asked for audio (uptime nanoseconds).
+    /// and when the host last asked for audio (uptime nanoseconds); and `log`.
     private let lock = NSLock()
     private var retryAt: Date?
     private var lastAsked: UInt64 = 0
+    private var logHandler: (@Sendable (String) -> Void)?
     private let keepFrames = StereoRing.Bounds.frames(ms: 40)
     private let marginFrames = StereoRing.Bounds.frames(ms: 20)
     private let trimAboveFrames = StereoRing.Bounds.frames(ms: 150)

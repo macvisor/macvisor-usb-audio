@@ -105,6 +105,18 @@ import Testing
         #expect(device.applyGain(.capture, to: pcm(value: 10000, frames: 1)) == pcm(value: 10000, frames: 1))
     }
 
+    /// The descriptor declares mute and volume on the master channel only: requests for a channel
+    /// stall.
+    @Test func featureUnitRequestsForAChannelStall() {
+        let device = UAC1AudioDevice()
+        for channel: UInt16 in [1, 2, 0xFF] {
+            #expect(device.handleControl(SetupPacket(requestType: 0x21, request: 0x01, value: 0x0100 | channel, index: 0x0200, length: 1), outData: Data([1])) == .stall)
+            #expect(device.handleControl(SetupPacket(requestType: 0xA1, request: 0x81, value: 0x0200 | channel, index: 0x0500, length: 2)) == .stall)
+        }
+        #expect(device.handleControl(SetupPacket(requestType: 0xA1, request: 0x81, value: 0x0100, index: 0x0200, length: 1)) == .data([0]))
+        #expect(device.applyGain(.playback, to: pcm(value: 1234, frames: 2)) == pcm(value: 1234, frames: 2))
+    }
+
     @Test func muteSilences() {
         let device = UAC1AudioDevice()
         _ = device.handleControl(SetupPacket(requestType: 0x21, request: 0x01, value: 0x0100, index: 0x0500, length: 1), outData: Data([1]))

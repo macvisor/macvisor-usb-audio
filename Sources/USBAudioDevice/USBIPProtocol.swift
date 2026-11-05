@@ -54,6 +54,8 @@ public enum USBIP {
         case transferTooLong(UInt32)
         case tooManyIsoPackets(UInt32)
         case isoPacketOutOfRange
+        /// A direction other than OUT (0) and IN (1).
+        case invalidDirection(UInt32)
     }
 }
 
@@ -245,7 +247,7 @@ extension USBIP {
             let flags = r.u32(), length = r.u32(), startFrame = r.u32(), packets = r.u32(), interval = r.u32()
             let setup = [UInt8](r.bytes(8))
             guard length <= UInt32(maxTransferLength) else { throw ProtocolError.transferTooLong(length) }
-            let direction = USBIP.Direction(rawValue: directionRaw) ?? .out
+            guard let direction = USBIP.Direction(rawValue: directionRaw) else { throw ProtocolError.invalidDirection(directionRaw) }
             let isIso = packets != noIsoPackets && packets != 0
             guard !isIso || packets <= UInt32(maxIsoPackets) else { throw ProtocolError.tooManyIsoPackets(packets) }
             let outData = direction == .out && length > 0 ? try stream.read(exactly: Int(length)) : Data()

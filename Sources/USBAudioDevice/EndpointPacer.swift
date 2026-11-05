@@ -143,6 +143,12 @@ public final class EndpointPacer: @unchecked Sendable {
         return true
     }
 
+    /// Runs `work` on the pacer's queue once the job running now, if any, has finished: an answer about
+    /// a URB that has left the queue goes out after that URB's own reply.
+    public func afterRunningJob(_ work: @escaping @Sendable () -> Void) {
+        queue.async(execute: work)
+    }
+
     /// Drops every queued URB without running it.
     public func cancelAll() {
         lock.lock()

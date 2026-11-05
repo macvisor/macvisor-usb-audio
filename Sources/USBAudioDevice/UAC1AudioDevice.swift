@@ -98,9 +98,13 @@ public final class UAC1AudioDevice: @unchecked Sendable {
     public let configurationDescriptor: [UInt8]
 
     /// Called (on the caller's thread, outside the device's lock) when streaming starts or stops.
-    public var onStreamEvent: (@Sendable (StreamEvent) -> Void)?
+    public var onStreamEvent: (@Sendable (StreamEvent) -> Void)? {
+        get { withLock { streamEventHandler } }
+        set { withLock { streamEventHandler = newValue } }
+    }
 
     private let lock = NSLock()
+    private var streamEventHandler: (@Sendable (StreamEvent) -> Void)?
     private var configuration: UInt8 = 0
     private var alternateSettings: [UInt8] = [0, 0, 0]
     private var muted: [UInt8: Bool] = [speakerFeatureUnit: false, microphoneFeatureUnit: false]
@@ -204,7 +208,8 @@ public final class UAC1AudioDevice: @unchecked Sendable {
             alternateSettings = [0, 0, 0]
             return e
         }
-        events.forEach { onStreamEvent?($0) }
+        let handler = onStreamEvent
+        events.forEach { handler?($0) }
     }
 
     // MARK: Control transfers
@@ -216,7 +221,8 @@ public final class UAC1AudioDevice: @unchecked Sendable {
             if case .data(let bytes) = r { return .data(Array(bytes.prefix(Int(setup.length)))) }
             return r
         }
-        events.forEach { onStreamEvent?($0) }
+        let handler = onStreamEvent
+        events.forEach { handler?($0) }
         return result
     }
 
@@ -276,9 +282,11 @@ public final class UAC1AudioDevice: @unchecked Sendable {
             if !get { return outData.count >= 3 && (UInt32(outData[0]) | UInt32(outData[1]) << 8 | UInt32(outData[2]) << 16) == 48000 ? .data([]) : .stall }
             return .data(s.request == 0x84 ? [1, 0, 0] : [0x80, 0xBB, 0x00]) // GET_RES : GET_CUR/MIN/MAX
         }
-        // Feature unit mute and volume (interface 0, entity in the high byte of wIndex).
+        // Feature unit mute and volume (interface 0, entity in the high byte of wIndex), on the master
+        // channel (0, the low byte of wValue): the only one whose controls the descriptor declares.
         let unit = UInt8(s.index >> 8)
         if recipient == 1, s.index & 0xFF == 0, unit == Self.speakerFeatureUnit || unit == Self.microphoneFeatureUnit {
+            guard s.value & 0xFF == 0 else { return .stall }
             switch (s.value >> 8, s.request) {
             case (0x01, 0x01): // SET_CUR mute
                 guard let first = outData.first else { return .stall }

@@ -39,6 +39,11 @@ import Testing
         #expect(throws: USBIP.ProtocolError.isoPacketOutOfRange) { try USBIP.readCommand(from: DataStream(message)) }
     }
 
+    @Test func rejectsADirectionPastIn() {
+        let stream = DataStream(ClientMessages.submit(sequence: 1, direction: 2, endpoint: 2, isoLengths: [192]))
+        #expect(throws: USBIP.ProtocolError.invalidDirection(2)) { try USBIP.readCommand(from: stream) }
+    }
+
     @Test func rejectsAnotherVersion() {
         var w = BigEndianWriter()
         w.u16(0x0106); w.u16(0x8005); w.u32(0)
