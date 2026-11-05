@@ -104,9 +104,11 @@ On Windows 11 26H2 ARM64, in a VM on Apple Virtualization.framework, with usbip-
 
 ## USB IDs
 
-- **Default:** vendor 0x1209, product 0x0001, [pid.codes'](https://pid.codes/) testing PID.
-- **Requested:** 1209:4112 from pid.codes for MacVisor USB Audio. Until it is assigned, use the testing
-  PID, or set `DeviceIdentity(productID:)` to your own.
+- **Default:** 1209:4112, MacVisor USB Audio's own IDs: vendor 0x1209 is [pid.codes'](https://pid.codes/),
+  product 0x4112 is this device's ([requested](https://github.com/pidcodes/pidcodes.github.com/pull/1354)).
+- **A device of your own:** if you change what the device does, give it your own PID with
+  `DeviceIdentity(productID:)` (or the server's `--product-id`). pid.codes' testing PID, 1209:0001, is
+  for experiments.
 
 ## Requirements
 

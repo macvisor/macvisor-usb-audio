@@ -17,7 +17,8 @@ func runServer() throws -> Never {
       --silent               microphone: silence
       --loopback             the guest's playback comes back as its microphone (latency tests)
       --record <file.wav>    write the guest's playback to a WAV file instead of playing it
-      --product-id <hex>     USB product ID (default 0001, pid.codes' testing PID under VID 1209)
+      --product-id <hex>     USB product ID (default 4112, MacVisor USB Audio's under VID 1209;
+                             0001 is pid.codes' testing PID)
       --verbose              log stream statistics every 10 seconds
     """
 
@@ -25,7 +26,7 @@ func runServer() throws -> Never {
     var microphone = "mac"
     var loopback = false
     var recordPath: String?
-    var productID: UInt16 = 0x0001
+    var productID: UInt16 = 0x4112
     var verbose = false
 
     var args = CommandLine.arguments.dropFirst().makeIterator()

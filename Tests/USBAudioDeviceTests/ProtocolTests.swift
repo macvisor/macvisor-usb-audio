@@ -66,6 +66,6 @@ import Testing
         _ = r.bytes(256)
         #expect(String(decoding: r.bytes(32).prefix { $0 != 0 }, as: UTF8.self) == "1-1")
         #expect(r.u32() == 1 && r.u32() == 1 && r.u32() == 2) // bus 1, device 1, full speed
-        #expect(r.u16() == 0x1209 && r.u16() == 0x0001)
+        #expect(r.u16() == 0x1209 && r.u16() == 0x4112)
     }
 }

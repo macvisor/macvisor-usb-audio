@@ -1,6 +1,7 @@
 import Foundation
 
-/// How the device introduces itself. pid.codes' testing PID (1209:0001) until a PID is assigned.
+/// How the device introduces itself: by default MacVisor USB Audio's own IDs, 1209:4112 (VID 1209 is
+/// pid.codes'; the PID is MacVisor USB Audio's). A device changed in a fork should have its own PID.
 public struct DeviceIdentity: Equatable, Sendable {
     public var vendorID: UInt16
     public var productID: UInt16
@@ -9,7 +10,7 @@ public struct DeviceIdentity: Equatable, Sendable {
     public var product: String
     public var serialNumber: String
 
-    public init(vendorID: UInt16 = 0x1209, productID: UInt16 = 0x0001, deviceRelease: UInt16 = 0x0100,
+    public init(vendorID: UInt16 = 0x1209, productID: UInt16 = 0x4112, deviceRelease: UInt16 = 0x0100,
                 manufacturer: String = "MacVisor", product: String = "MacVisor Audio", serialNumber: String = "0001") {
         self.vendorID = vendorID
         self.productID = productID
