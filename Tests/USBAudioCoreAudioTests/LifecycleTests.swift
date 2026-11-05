@@ -18,9 +18,9 @@ import Testing
         sink?.waitForQueue()
         let output = try #require(outputs.all.first)
         #expect(output.isRunning)
-        weak let freed = sink
+        let freed = Weak(sink)
         sink = nil
-        #expect(freed == nil)
+        #expect(freed.object == nil)
         #expect(!output.isRunning && output.stopCount >= 1)
     }
 
@@ -113,9 +113,9 @@ import Testing
         source?.waitForQueue()
         let input = try #require(inputs.all.first)
         #expect(input.isRunning)
-        weak let freed = source
+        let freed = Weak(source)
         source = nil
-        #expect(freed == nil)
+        #expect(freed.object == nil)
         #expect(!input.isRunning && input.stopCount >= 1)
     }
 

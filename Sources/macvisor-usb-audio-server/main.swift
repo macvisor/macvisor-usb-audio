@@ -83,11 +83,11 @@ func runServer() throws -> Never {
     let device = UAC1AudioDevice(identity: DeviceIdentity(productID: productID))
     let server = USBAudioServer(device: device, playback: playback, capture: capture)
     server.log = log
-    // A connection that imports nothing in 10 s is closed, and at most `maxConnections` are served at
-    // once (one imports the device; the rest are a client re-attaching): nobody holds the server with
-    // idle connections or a thread each.
+    // A connection that imports nothing in 10 s is closed, and at most four are served at once (one
+    // imports the device; the rest are a client re-attaching): nobody holds the server with idle
+    // connections or a thread each.
     server.importTimeout = 10
-    let maxConnections = 4
+    let places = ConnectionPlaces(4)
 
     // A plain TCP listener; each connection is served on a thread of its own.
     let parts = listenAddress.split(separator: ":")
@@ -130,8 +130,6 @@ func runServer() throws -> Never {
         statisticsTimer.resume()
     }
 
-    let connections = NSLock()
-    nonisolated(unsafe) var served = 0
     Thread.detachNewThread {
         // After a failed accept() (out of descriptors, say), a growing pause, not a busy loop.
         var pause: TimeInterval = 0
@@ -144,22 +142,39 @@ func runServer() throws -> Never {
                 continue
             }
             pause = 0
-            let admitted: Bool = connections.withLock {
-                guard served < maxConnections else { return false }
-                served += 1
-                return true
-            }
-            guard admitted else {
+            guard places.take() else {
                 close(client)
                 continue
             }
             Thread.detachNewThread {
                 server.serve(FileDescriptorStream(fileDescriptor: client))
-                connections.withLock { served -= 1 }
+                places.give()
             }
         }
     }
     dispatchMain()
+}
+
+/// The connections served at once, at most `limit`.
+final class ConnectionPlaces: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private var taken = 0
+
+    init(_ limit: Int) { self.limit = limit }
+
+    /// Takes a place; false when none is free.
+    func take() -> Bool {
+        lock.withLock {
+            guard taken < limit else { return false }
+            taken += 1
+            return true
+        }
+    }
+
+    func give() {
+        lock.withLock { taken -= 1 }
+    }
 }
 
 try runServer()

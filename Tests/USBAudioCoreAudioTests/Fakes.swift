@@ -15,6 +15,12 @@ final class Box<T>: @unchecked Sendable {
     func mutate<R>(_ body: (inout T) -> R) -> R { lock.withLock { body(&stored) } }
 }
 
+/// Holds an object without keeping it alive.
+final class Weak<T: AnyObject> {
+    weak var object: T?
+    init(_ object: T?) { self.object = object }
+}
+
 /// A clock the test moves by hand. Scheduled work runs, in deadline order, as time passes it.
 final class SimulatedClock: PacerClock, @unchecked Sendable {
     private let lock = NSLock()
