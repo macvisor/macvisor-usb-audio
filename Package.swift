@@ -17,6 +17,6 @@ let package = Package(
         // A stand-alone USB/IP server for trying the device with a USB/IP client such as usbip-win2.
         .executableTarget(name: "macvisor-usb-audio-server", dependencies: ["USBAudioDevice", "USBAudioCoreAudio"]),
         .testTarget(name: "USBAudioDeviceTests", dependencies: ["USBAudioDevice"]),
-        .testTarget(name: "USBAudioCoreAudioTests", dependencies: ["USBAudioCoreAudio"]),
+        .testTarget(name: "USBAudioCoreAudioTests", dependencies: ["USBAudioCoreAudio", "USBAudioDevice"]),
     ]
 )

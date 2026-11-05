@@ -160,26 +160,16 @@ public final class USBAudioServer: @unchecked Sendable {
         log?("device \(busID) detached (playback: \(p.completedURBs) URBs, \(p.lateURBs) late, \(p.timelineRestarts) restarts; capture: \(c.completedURBs) URBs, \(c.lateURBs) late)")
     }
 
-    /// Locks the playback timeline to the sink's clock: when the sink's buffer grows the pacer slows,
-    /// when it drains the pacer speeds up (a few hundred ppm at most; clock drift is tens of ppm). The
-    /// set point is the level the buffer settles at in the first two seconds of a stream.
+    /// Locks the playback timeline to the sink's clock, holding the sink's buffer at the lead
+    /// (`PlaybackSteering`), every quarter of a second.
     private func startSteering(_ s: Session) {
         guard playback.bufferedSeconds != nil else { return }
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "usb-audio.steering", qos: .utility))
-        var average: Double?, setPoint: Double?, samples = 0
+        var steering = PlaybackSteering(setPoint: lead)
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
         timer.setEventHandler { [device, playback] in
-            guard device.isPlaybackActive, let level = playback.bufferedSeconds else {
-                average = nil; setPoint = nil; samples = 0
-                s.playbackPacer.setRateAdjustment(ppm: 0)
-                return
-            }
-            let a = average.map { $0 * 0.9 + level * 0.1 } ?? level
-            average = a
-            samples += 1
-            guard samples > 8 else { setPoint = a; return }
-            let error = a - (setPoint ?? a) // seconds; positive: too much buffered
-            s.playbackPacer.setRateAdjustment(ppm: max(-500, min(500, -error * 20_000)))
+            let level = device.isPlaybackActive ? playback.bufferedSeconds : nil
+            s.playbackPacer.setRateAdjustment(ppm: steering.adjustment(level: level))
         }
         s.steering = timer
         timer.resume()
@@ -269,5 +259,41 @@ public final class USBAudioServer: @unchecked Sendable {
         let packets = urb.isIsochronous ? urb.isoPackets.map { IsoPacket(offset: $0.offset, length: $0.length, actualLength: 0, status: USBIP.Status.stall) } : nil
         s.send(USBIP.encodeSubmitReply(sequence: urb.sequence, status: USBIP.Status.stall, actualLength: 0,
                                        startFrame: urb.startFrame, isoPackets: packets, errorCount: UInt32(packets?.count ?? 0)))
+    }
+}
+
+/// Locks the playback timeline to the sink's clock: when the sink's buffer grows the pacer slows, when
+/// it drains the pacer speeds up (a few hundred ppm at most; clock drift is tens of ppm).
+///
+/// The set point is fixed: the server's lead, which is what the guest keeps queued and what a sink
+/// holds (`CoreAudioPlayback` does). One learned from the first two seconds of a stream learned the
+/// half second an output engine took to start, and held it (5 Nov 2026). The first two seconds still
+/// only follow the level, without steering: an output engine starts in them.
+struct PlaybackSteering {
+    let setPoint: Double
+    private var average: Double?
+    private var samples = 0
+
+    init(setPoint: Double) {
+        self.setPoint = setPoint
+    }
+
+    /// The pacer's rate adjustment, in ppm, for the sink's level sampled every quarter of a second;
+    /// nil while nothing plays, which starts over.
+    mutating func adjustment(level: Double?) -> Double {
+        guard let level else {
+            average = nil
+            samples = 0
+            return 0
+        }
+        samples += 1
+        guard samples > 8, let previous = average else {
+            average = level
+            return 0
+        }
+        let a = previous * 0.9 + level * 0.1
+        average = a
+        let error = a - setPoint // seconds; positive: too much buffered
+        return max(-500, min(500, -error * 20_000))
     }
 }

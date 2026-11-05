@@ -43,13 +43,17 @@ Windows app → audio engine → usbaudio.sys (Microsoft)
 - `EndpointPacer` completes each endpoint's URBs **in submission order** on a **fixed timeline**.
 - Playback URBs complete 40 ms early, so the guest keeps that much audio queued, which absorbs jitter.
 - A URB that arrives late completes at once, and the stream's long-run rate stays exact.
-- The playback timeline is steered by the output buffer's level, so the guest follows the Mac's audio
-  clock.
+- The playback timeline is steered to hold the output buffer at those 40 ms, so the guest follows the
+  Mac's audio clock.
+- `CoreAudioPlayback` holds what the guest keeps queued: an output engine starts with the newest 40 ms
+  (it can take half a second to start), the buffer never holds more than 100 ms, and what a stall
+  leaves behind once the late URBs catch up is dropped.
 - Windows keeps only about two 10 ms URBs in flight, which is why these rules matter.
 
 **Privacy.** `CoreAudioCapture` opens the Mac's microphone only while the guest records (the capture
 interface's alternate setting 1), so macOS's microphone indicator shows exactly when the guest is
-listening.
+listening. A guest that stops asking for audio for a second (a paused VM) has it closed until it asks
+again.
 
 **One session per device.** A second import is refused while a client has the device, so a client
 can't present it to the guest twice. After a VM is restored, its old connections are dead without
@@ -63,7 +67,7 @@ audio at most:
 
 With `importTimeout` set, a connection that imports nothing within it is closed, so idle connections
 can't hold a server's places. `CoreAudioPlayback` and `CoreAudioCapture` follow a change of the Mac's
-output or input device.
+output or input device, and stop their engines when they are freed.
 
 ## Try it
 
