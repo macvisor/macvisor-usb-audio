@@ -6,7 +6,8 @@ import USBAudioDevice
 ///
 /// The output engine starts when the host starts streaming and stops `idleStop` after it stops, so a
 /// short system sound right after another doesn't pay for an engine start. A CoreAudioPlayback that is
-/// freed stops its engine at once (a runner drops its USB audio after a restart with other settings).
+/// freed stops its engine at once, on a queue of its own (a runner drops its USB audio after a restart
+/// with other settings, on its main thread).
 ///
 /// **Latency.** The server completes playback URBs 40 ms (its lead) before their audio is due, so the
 /// guest keeps that much queued, and that much is what the ring holds (`StereoRing.Bounds.playback`):
@@ -72,10 +73,11 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     }
 
     deinit {
-        // Nothing else holds this object, so nothing of it runs on the queue any more: the output stops
-        // here, and with it the Mac's audio and the engine's notifications.
+        // Nothing else holds this object, so nothing of it runs on the queue any more. The output stops
+        // on a queue of its own: this may be the main thread, and an engine's stop takes 25–40 ms (more
+        // on Bluetooth). With it go the Mac's audio and the engine's notifications.
         idleTimer.cancel()
-        output?.stop()
+        if let output { retireEngine { output.stop() } }
     }
 
     public var bufferedSeconds: Double? {
@@ -264,8 +266,17 @@ final class StreamRequests: @unchecked Sendable {
     var statistics: Statistics { lock.withLock { counts } }
 }
 
+/// Where engines that are let go stop (5 Nov 2026): a CoreAudioPlayback or CoreAudioCapture can be
+/// freed on the main thread, and an engine's stop takes 25–40 ms there, more on Bluetooth.
+private let engineTeardownQueue = DispatchQueue(label: "usb-audio.coreaudio.teardown", qos: .utility)
+
+/// Stops an engine (`stop`) on a queue of its own, holding it until then.
+func retireEngine(_ stop: @escaping @Sendable () -> Void) {
+    engineTeardownQueue.async(execute: stop)
+}
+
 /// An output as CoreAudioPlayback drives it: an AVAudioEngine in use, a stand-in in tests.
-protocol PlaybackOutput: AnyObject {
+protocol PlaybackOutput: AnyObject, Sendable {
     var isRunning: Bool { get }
     var formatDescription: String { get }
     /// Starts playing what the ring holds; may take half a second.
@@ -369,7 +380,7 @@ struct StartBackoff {
 /// A host that stops asking for audio while it records (a paused VM, a hung guest) gets the
 /// microphone closed after `idleClose` (a second): it opens again at the host's next request, by the
 /// same path as a retry, so a paused VM doesn't keep the Mac's microphone open. A freed
-/// CoreAudioCapture closes it at once.
+/// CoreAudioCapture closes it at once, on a queue of its own.
 ///
 /// **A guest starting and stopping its recording in a loop** (5 Nov 2026): each start used to build and
 /// start an engine (0.1–0.5 s) and reset the failures' pause, so the queue fell behind and grew. Now
@@ -425,9 +436,10 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     }
 
     deinit {
-        // As for playback: nothing of this object runs on the queue any more; the microphone closes here.
+        // As for playback: nothing of this object runs on the queue any more; the microphone closes now,
+        // on the engines' own queue rather than the thread that let this go.
         watchdog?.cancel()
-        input?.stop()
+        if let input { retireEngine { input.stop() } }
     }
 
     public func captureStarted() {
@@ -593,7 +605,7 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
 }
 
 /// An input as CoreAudioCapture drives it: an AVAudioEngine in use, a stand-in in tests.
-protocol CaptureInput: AnyObject {
+protocol CaptureInput: AnyObject, Sendable {
     var isRunning: Bool { get }
     var formatDescription: String { get }
     /// Opens the microphone, writing to the ring.

@@ -21,7 +21,25 @@ import Testing
         let freed = Weak(sink)
         sink = nil
         #expect(freed.object == nil)
-        #expect(!output.isRunning && output.stopCount >= 1)
+        #expect(eventually { !output.isRunning && output.stopCount >= 1 })
+    }
+
+    /// The runner lets its USB audio go on its main thread, and an engine's stop takes 25-40 ms there,
+    /// more on Bluetooth: a freed playback hands its output to a queue to stop, and returns at once.
+    @Test func aFreedPlaybackDoesNotWaitForItsOutputToStop() throws {
+        let outputs = FakeOutputs()
+        let stopGate = DispatchSemaphore(value: 0)
+        outputs.stopGate = stopGate
+        var sink: CoreAudioPlayback? = playback(outputs)
+        sink?.playbackStarted()
+        sink?.waitForQueue()
+        let output = try #require(outputs.all.first)
+        let freed = Weak(sink)
+        sink = nil // a stop here would wait 10 s for the gate, and be counted
+        #expect(freed.object == nil)
+        #expect(output.stopCount == 0)
+        stopGate.signal()
+        #expect(eventually { !output.isRunning && output.stopCount == 1 })
     }
 
     /// A device change in the idle window after a stream used to build the engine again and cancel
@@ -117,7 +135,25 @@ import Testing
         let freed = Weak(source)
         source = nil
         #expect(freed.object == nil)
-        #expect(!input.isRunning && input.stopCount >= 1)
+        #expect(eventually { !input.isRunning && input.stopCount >= 1 })
+    }
+
+    /// As for playback: the microphone closes on a queue of its own, not on the thread that lets the
+    /// capture go.
+    @Test func aFreedCaptureDoesNotWaitForTheMicrophoneToClose() throws {
+        let inputs = FakeInputs()
+        let stopGate = DispatchSemaphore(value: 0)
+        inputs.stopGate = stopGate
+        var source: CoreAudioCapture? = capture(inputs)
+        source?.captureStarted()
+        source?.waitForQueue()
+        let input = try #require(inputs.all.first)
+        let freed = Weak(source)
+        source = nil // a stop here would wait 10 s for the gate, and be counted
+        #expect(freed.object == nil)
+        #expect(input.stopCount == 0)
+        stopGate.signal()
+        #expect(eventually { !input.isRunning && input.stopCount == 1 })
     }
 
     /// A paused VM asks for no audio: the microphone closes, and opens again, once, when it asks.

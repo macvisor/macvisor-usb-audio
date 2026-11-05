@@ -64,17 +64,19 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
     private let gate: DispatchSemaphore?
     private let changeWhileStarting: Bool
     private let fails: Bool
+    private let stopGate: DispatchSemaphore?
     private let lock = NSLock()
     private var running = false
     private var stops = 0
 
     init(ring: StereoRing, changed: @escaping @Sendable () -> Void, gate: DispatchSemaphore?, changeWhileStarting: Bool,
-         fails: Bool = false) {
+         fails: Bool = false, stopGate: DispatchSemaphore? = nil) {
         self.ring = ring
         self.changed = changed
         self.gate = gate
         self.changeWhileStarting = changeWhileStarting
         self.fails = fails
+        self.stopGate = stopGate
     }
 
     struct Failure: Error {}
@@ -90,7 +92,10 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
         if changeWhileStarting { deviceChanged() }
     }
 
+    /// Waits for `stopGate` first, when set (an engine's stop takes 25-40 ms, more on Bluetooth); not
+    /// for ever, so a test that gets it wrong fails rather than hangs.
     func stop() {
+        _ = stopGate?.wait(timeout: .now() + 10)
         lock.withLock {
             running = false
             stops += 1
@@ -128,6 +133,8 @@ final class FakeOutputs: @unchecked Sendable {
     /// Each start waits for this, when set.
     var gate: DispatchSemaphore?
     var changeWhileStarting = false
+    /// Each stop waits for this, when set.
+    var stopGate: DispatchSemaphore?
 
     /// Starts fail while set.
     var fail: Bool {
@@ -148,7 +155,7 @@ final class FakeOutputs: @unchecked Sendable {
         }
         if failsToBuild { throw FakeOutput.Failure() }
         let output = FakeOutput(ring: ring, changed: changed, gate: gate, changeWhileStarting: changeWhileStarting,
-                                fails: fails)
+                                fails: fails, stopGate: stopGate)
         lock.withLock { built.append(output) }
         return output
     }
@@ -164,14 +171,16 @@ final class FakeInput: CaptureInput, @unchecked Sendable {
     let ring: StereoRing
     let changed: @Sendable () -> Void
     private let fails: Bool
+    private let stopGate: DispatchSemaphore?
     private let lock = NSLock()
     private var running = false
     private var stops = 0
 
-    init(ring: StereoRing, changed: @escaping @Sendable () -> Void, fails: Bool) {
+    init(ring: StereoRing, changed: @escaping @Sendable () -> Void, fails: Bool, stopGate: DispatchSemaphore? = nil) {
         self.ring = ring
         self.changed = changed
         self.fails = fails
+        self.stopGate = stopGate
     }
 
     struct Failure: Error {}
@@ -185,7 +194,9 @@ final class FakeInput: CaptureInput, @unchecked Sendable {
         lock.withLock { running = true }
     }
 
+    /// As `FakeOutput.stop`.
     func stop() {
+        _ = stopGate?.wait(timeout: .now() + 10)
         lock.withLock {
             running = false
             stops += 1
@@ -200,6 +211,8 @@ final class FakeInputs: @unchecked Sendable {
     private var asked: [Date] = []
     private var failing = false
     private var failingToBuild = false
+    /// Each stop waits for this, when set.
+    var stopGate: DispatchSemaphore?
 
     /// Starts fail while set.
     var fail: Bool {
@@ -220,7 +233,7 @@ final class FakeInputs: @unchecked Sendable {
             return (failing, failingToBuild)
         }
         if failsToBuild { throw FakeInput.Failure() }
-        let input = FakeInput(ring: ring, changed: changed, fails: fails)
+        let input = FakeInput(ring: ring, changed: changed, fails: fails, stopGate: stopGate)
         lock.withLock { built.append(input) }
         return input
     }
