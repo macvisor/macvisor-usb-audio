@@ -63,7 +63,10 @@ anyone noticing: call `disconnectAll()` first.
 audio at most:
 - transfers longer than the device ever needs end the session;
 - isochronous packets longer than twice wMaxPacketSize, or summing past their buffer, stall;
-- each endpoint queues at most 64 URBs, reaching at most 2 s ahead, and stalls the rest.
+- each endpoint queues at most 64 URBs, reaching at most 2 s ahead, and stalls the rest;
+- a guest starting and stopping a stream in a loop costs one queued block at a time: the output
+  engine starts once, the microphone opens a quarter of a second after its last opening at the
+  soonest, and an engine that fails to start keeps its growing pause across the starts.
 
 With `importTimeout` set, a connection that imports nothing within it is closed, so idle connections
 can't hold a server's places. `CoreAudioPlayback` and `CoreAudioCapture` follow a change of the Mac's

@@ -30,6 +30,7 @@ import Testing
         let outputs = FakeOutputs()
         let sink = playback(outputs)
         sink.playbackStarted()
+        sink.waitForQueue() // a start and a stop the queue takes together start nothing
         sink.playbackStopped()
         sink.waitForQueue()
         let output = try #require(outputs.all.first)

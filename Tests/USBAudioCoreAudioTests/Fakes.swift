@@ -63,16 +63,21 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
     let changed: @Sendable () -> Void
     private let gate: DispatchSemaphore?
     private let changeWhileStarting: Bool
+    private let fails: Bool
     private let lock = NSLock()
     private var running = false
     private var stops = 0
 
-    init(ring: StereoRing, changed: @escaping @Sendable () -> Void, gate: DispatchSemaphore?, changeWhileStarting: Bool) {
+    init(ring: StereoRing, changed: @escaping @Sendable () -> Void, gate: DispatchSemaphore?, changeWhileStarting: Bool,
+         fails: Bool = false) {
         self.ring = ring
         self.changed = changed
         self.gate = gate
         self.changeWhileStarting = changeWhileStarting
+        self.fails = fails
     }
+
+    struct Failure: Error {}
 
     var isRunning: Bool { lock.withLock { running } }
     var stopCount: Int { lock.withLock { stops } }
@@ -80,6 +85,7 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
 
     func start() throws {
         gate?.wait()
+        if fails { throw Failure() }
         lock.withLock { running = true }
         if changeWhileStarting { deviceChanged() }
     }
@@ -112,21 +118,37 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
     }
 }
 
-/// Builds `FakeOutput`s and remembers them.
+/// Builds `FakeOutput`s and remembers them, and when each was asked for.
 final class FakeOutputs: @unchecked Sendable {
     private let lock = NSLock()
     private var built: [FakeOutput] = []
+    private var asked: [Date] = []
+    private var failing = false
     /// Each start waits for this, when set.
     var gate: DispatchSemaphore?
     var changeWhileStarting = false
 
+    /// Starts fail while set.
+    var fail: Bool {
+        get { lock.withLock { failing } }
+        set { lock.withLock { failing = newValue } }
+    }
+
     func make(_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) -> any PlaybackOutput {
-        let output = FakeOutput(ring: ring, changed: changed, gate: gate, changeWhileStarting: changeWhileStarting)
+        let fails = lock.withLock {
+            asked.append(Date())
+            return failing
+        }
+        let output = FakeOutput(ring: ring, changed: changed, gate: gate, changeWhileStarting: changeWhileStarting,
+                                fails: fails)
         lock.withLock { built.append(output) }
         return output
     }
 
     var all: [FakeOutput] { lock.withLock { built } }
+
+    /// When each output was asked for: the start attempts.
+    var attempts: [Date] { lock.withLock { asked } }
 }
 
 /// Stands in for an AVAudioEngine input.
@@ -163,20 +185,33 @@ final class FakeInput: CaptureInput, @unchecked Sendable {
     }
 }
 
-/// Builds `FakeInput`s and remembers them.
+/// Builds `FakeInput`s and remembers them, and when each was asked for.
 final class FakeInputs: @unchecked Sendable {
     private let lock = NSLock()
     private var built: [FakeInput] = []
+    private var asked: [Date] = []
+    private var failing = false
+
     /// Starts fail while set.
-    var fail = false
+    var fail: Bool {
+        get { lock.withLock { failing } }
+        set { lock.withLock { failing = newValue } }
+    }
 
     func make(_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) throws -> any CaptureInput {
-        let input = FakeInput(ring: ring, changed: changed, fails: lock.withLock { fail })
+        let fails = lock.withLock {
+            asked.append(Date())
+            return failing
+        }
+        let input = FakeInput(ring: ring, changed: changed, fails: fails)
         lock.withLock { built.append(input) }
         return input
     }
 
     var all: [FakeInput] { lock.withLock { built } }
+
+    /// When each input was asked for: the attempts to open the microphone.
+    var attempts: [Date] { lock.withLock { asked } }
 }
 
 /// 16-bit stereo PCM whose frames carry their own index (`first` onwards): the left sample has its

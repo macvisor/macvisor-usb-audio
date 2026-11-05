@@ -23,7 +23,11 @@ import USBAudioDevice
 /// AVAudioEngine and posts `AVAudioEngineConfigurationChange`: while the host streams, the engine is
 /// built again on the new device, at most once a second (a headset switching profiles posts several in
 /// a row); in the idle window after a stream it just stops. An engine that fails to start is tried
-/// again after a growing pause (`StartBackoff`), not at every URB.
+/// again after a growing pause (`StartBackoff`), not at every URB or stream start.
+///
+/// **A guest starting and stopping its stream in a loop** (SET_INTERFACE as fast as it can send it)
+/// sets what it wants, and the queue acts on the last of it (`StreamRequests`): however many starts and
+/// stops, the queue holds one block at most besides the one running, and the engine starts once.
 public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     public var log: (@Sendable (String) -> Void)? {
         get { logLock.withLock { logHandler } }
@@ -36,13 +40,19 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     private let idleStop: TimeInterval
     private let makeOutput: MakePlaybackOutput
     private let queue = DispatchQueue(label: "usb-audio.coreaudio.playback")
+    /// Whether the host streams, as it said last; acted on by `reconcile`.
+    private let requests = StreamRequests()
+    /// The idle stop: one timer, set again by each stop. It used to be a work item per stop, each
+    /// held for 30 s, cancelled or not (5 Nov 2026).
+    private let idleTimer: DispatchSourceTimer
     // On the queue:
     private var output: (any PlaybackOutput)?
     /// Counts the outputs built: a change notification about an older one is stale.
     private var generation = 0
-    /// Between playbackStarted and playbackStopped.
+    /// Between playbackStarted and playbackStopped, as `reconcile` last acted on it.
     private var streaming = false
-    private var stopWork: DispatchWorkItem?
+    /// When the idle timer stops the output (nil: it doesn't).
+    private var idleStopAt: DispatchTime?
     private var backoff = StartBackoff()
 
     public convenience init(idleStop: TimeInterval = 30) {
@@ -55,12 +65,16 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         self.idleStop = idleStop
         ring = StereoRing(capacitySeconds: 0.5, bounds: bounds)
         self.makeOutput = makeOutput
+        idleTimer = DispatchSource.makeTimerSource(queue: queue)
+        idleTimer.setEventHandler { [weak self] in self?.idleTimerFired() }
+        idleTimer.schedule(deadline: .distantFuture)
+        idleTimer.activate()
     }
 
     deinit {
         // Nothing else holds this object, so nothing of it runs on the queue any more: the output stops
         // here, and with it the Mac's audio and the engine's notifications.
-        stopWork?.cancel()
+        idleTimer.cancel()
         output?.stop()
     }
 
@@ -71,41 +85,70 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     /// What the ring dropped to hold the latency (tests).
     var ringStatistics: StereoRing.Statistics { ring.statistics }
 
+    /// How the stream events and URBs queued their work (tests).
+    var queueStatistics: StreamRequests.Statistics { requests.statistics }
+
     public func playbackStarted() {
-        queue.async { [self] in
-            streaming = true
-            stopWork?.cancel()
-            stopWork = nil
-            startOutput()
-        }
+        request(streaming: true)
     }
 
     public func play(_ pcm: Data) {
         ring.write(int16: pcm)
-        queue.async { [self] in
-            guard streaming else { return }
-            if let output {
-                // Stopped without a notification (or before it is handled): the same as a change.
-                if !output.isRunning { outputChanged(generation: generation) }
-            } else if backoff.mayTry(at: Date()) {
-                startOutput()
-            }
-        }
+        // The output's check, with the stream's events: one block for all of them.
+        request(streaming: nil)
     }
 
     public func playbackStopped() {
-        queue.async { [self] in
-            streaming = false
-            stopWork?.cancel()
-            let work = DispatchWorkItem { [weak self] in self?.stopOutput() }
-            stopWork = work
-            queue.asyncAfter(deadline: .now() + idleStop, execute: work)
-        }
+        request(streaming: false)
     }
 
     /// Waits for what the queue has to do (tests).
     func waitForQueue() {
         queue.sync {}
+    }
+
+    private func request(streaming wanted: Bool?) {
+        guard requests.request(wanted) else { return }
+        queue.async { [self] in
+            reconcile()
+            requests.ran()
+        }
+    }
+
+    /// On the queue: acts on what the host said last, and checks the output while it streams.
+    private func reconcile() {
+        let wanted = requests.take()
+        if wanted != streaming {
+            streaming = wanted
+            if wanted {
+                setIdleStop(nil)
+            } else {
+                setIdleStop(.now() + idleStop)
+            }
+        }
+        guard streaming else { return }
+        if let output {
+            // Stopped without a notification (or before it is handled): the same as a change.
+            if !output.isRunning { outputChanged(generation: generation) }
+        } else if backoff.mayTry(at: Date()) {
+            startOutput()
+        }
+    }
+
+    /// On the queue.
+    private func setIdleStop(_ at: DispatchTime?) {
+        idleStopAt = at
+        idleTimer.schedule(deadline: at ?? .distantFuture)
+    }
+
+    /// On the queue: a fire from before the timer was set again stops nothing.
+    private func idleTimerFired() {
+        guard let at = idleStopAt, !streaming else { return }
+        guard DispatchTime.now() >= at else {
+            idleTimer.schedule(deadline: at)
+            return
+        }
+        stopOutput()
     }
 
     /// On the queue.
@@ -159,14 +202,62 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     }
 
     private func stopOutput() {
-        stopWork?.cancel()
-        stopWork = nil
+        setIdleStop(nil)
         let stopped = output != nil
         teardown()
         ring.clear()
         backoff = StartBackoff()
         if stopped { log?("playback: output engine stopped") }
     }
+}
+
+/// What the host asked for last (streaming or not), and whether a block is queued to act on it
+/// (5 Nov 2026). A guest can start and stop a stream as fast as it sends SET_INTERFACE; a block per
+/// event kept the queue busy long after a flood ended (each microphone start built an engine) and let
+/// it grow without bound. Now an event only sets what the host wants, and a block is queued when none
+/// is: whatever the host does, the queue holds one at most besides the one running, and that one acts
+/// on the latest.
+final class StreamRequests: @unchecked Sendable {
+    /// Blocks queued in all, and the most queued or running at once (tests).
+    struct Statistics: Sendable {
+        var queued = 0
+        var mostAtOnce = 0
+    }
+
+    private let lock = NSLock()
+    private var wanted = false
+    private var blockQueued = false
+    private var atOnce = 0
+    private var counts = Statistics()
+
+    /// Sets what the host wants (nil: as it is); returns whether to queue a block, which calls `take`
+    /// and, when it's done, `ran`.
+    func request(_ wanted: Bool?) -> Bool {
+        lock.withLock {
+            if let wanted { self.wanted = wanted }
+            guard !blockQueued else { return false }
+            blockQueued = true
+            atOnce += 1
+            counts.queued += 1
+            counts.mostAtOnce = max(counts.mostAtOnce, atOnce)
+            return true
+        }
+    }
+
+    /// In the queued block: what the host wants now. A request from here on queues another block.
+    func take() -> Bool {
+        lock.withLock {
+            blockQueued = false
+            return wanted
+        }
+    }
+
+    /// The queued block is done.
+    func ran() {
+        lock.withLock { atOnce -= 1 }
+    }
+
+    var statistics: Statistics { lock.withLock { counts } }
 }
 
 /// An output as CoreAudioPlayback drives it: an AVAudioEngine in use, a stand-in in tests.
@@ -263,24 +354,37 @@ struct StartBackoff {
 /// microphone closed after `idleClose` (a second): it opens again at the host's next request, by the
 /// same path as a retry, so a paused VM doesn't keep the Mac's microphone open. A freed
 /// CoreAudioCapture closes it at once.
+///
+/// **A guest starting and stopping its recording in a loop** (5 Nov 2026): each start used to build and
+/// start an engine (0.1–0.5 s) and reset the failures' pause, so the queue fell behind and grew. Now
+/// the starts and stops set what the host wants and the queue acts on the last of it
+/// (`StreamRequests`); the microphone opens `openSpacing` after its last opening at the soonest, and
+/// a failure's pause holds across starts.
 public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     public var log: (@Sendable (String) -> Void)? {
         get { lock.withLock { logHandler } }
         set { lock.withLock { logHandler = newValue } }
     }
 
+    /// The least time from one opening of the microphone to the next.
+    static let openSpacing: TimeInterval = 0.25
+
     /// A second: room for the tap's 100 ms buffers and what the trim keeps around them.
     private let ring = StereoRing(capacitySeconds: 1)
     private let queue = DispatchQueue(label: "usb-audio.coreaudio.capture")
     private let makeInput: MakeCaptureInput
     private let idleClose: TimeInterval
+    /// Whether the host records, as it said last; acted on by `reconcile`.
+    private let requests = StreamRequests()
     // On the queue:
     private var input: (any CaptureInput)?
     /// Counts the inputs built: a change notification about an older one is stale.
     private var generation = 0
-    /// Whether the host records, and the start pauses.
+    /// Whether the host records, as `reconcile` last acted on it, and the start pauses.
     private var wanted = false
     private var backoff = StartBackoff()
+    /// When the microphone was last opened, or tried.
+    private var lastOpen: Date?
     /// While the microphone is open: closes it when the host stops asking.
     private var watchdog: DispatchSourceTimer?
     /// Shared with the server's thread: when a start is due (the host records, no microphone is open),
@@ -311,21 +415,11 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     }
 
     public func captureStarted() {
-        queue.async { [self] in
-            wanted = true
-            backoff = StartBackoff()
-            startInput()
-        }
+        request(recording: true)
     }
 
     public func captureStopped() {
-        queue.async { [self] in
-            wanted = false
-            setRetry(at: nil)
-            teardown()
-            ring.clear()
-            log?("capture: microphone closed")
-        }
+        request(recording: false)
     }
 
     public func captureAudio(byteCount: Int) -> Data {
@@ -336,7 +430,7 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
             retryAt = nil // one try; the queue says when the next is due
             return true
         }
-        if due { queue.async { [self] in retry() } }
+        if due { queue.async { [self] in open() } }
         var audio = ring.readInt16(frames: byteCount / UAC1AudioDevice.bytesPerFrame, keepFrames: keepFrames,
                                    marginFrames: marginFrames, trimAboveFrames: trimAboveFrames).0
         // Exactly byteCount, as the protocol says: the reply's length is the host's.
@@ -347,9 +441,36 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     /// Whether the microphone is open (tests).
     var isOpen: Bool { queue.sync { input != nil } }
 
+    /// How the stream events queued their work (tests).
+    var queueStatistics: StreamRequests.Statistics { requests.statistics }
+
     /// Waits for what the queue has to do (tests).
     func waitForQueue() {
         queue.sync {}
+    }
+
+    private func request(recording: Bool) {
+        guard requests.request(recording) else { return }
+        queue.async { [self] in
+            reconcile()
+            requests.ran()
+        }
+    }
+
+    /// On the queue: acts on what the host said last. A start and a stop in between act on nothing.
+    private func reconcile() {
+        let recording = requests.take()
+        guard recording != wanted else { return }
+        wanted = recording
+        if recording {
+            open()
+        } else {
+            setRetry(at: nil)
+            let wasOpen = input != nil
+            teardown()
+            ring.clear()
+            if wasOpen { log?("capture: microphone closed") }
+        }
     }
 
     private func setRetry(at date: Date?) {
@@ -363,11 +484,19 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
         input = nil
     }
 
-    /// On the queue: the host asked for audio while a start was due.
-    private func retry() {
+    /// On the queue: when the microphone may open next, after a failure's pause (or a device change's)
+    /// and `openSpacing` after its last opening.
+    private var nextOpen: Date {
+        max(backoff.nextTry, lastOpen.map { $0.addingTimeInterval(Self.openSpacing) } ?? .distantPast)
+    }
+
+    /// On the queue (the host started recording, or asked for audio while a start was due): opens the
+    /// microphone if it may now, or has the host's first request from then on do it.
+    private func open() {
         guard wanted, input == nil else { return }
-        guard backoff.mayTry(at: Date()) else {
-            setRetry(at: backoff.nextTry)
+        let at = nextOpen
+        guard Date() >= at else {
+            setRetry(at: at)
             return
         }
         startInput()
@@ -376,6 +505,7 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     /// On the queue.
     private func startInput() {
         guard wanted, input == nil else { return }
+        lastOpen = Date()
         generation += 1
         let current = generation
         let input: any CaptureInput
@@ -387,7 +517,7 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
             }
         } catch {
             if backoff.failed(at: Date()) == 1 { log?("capture: no usable input device (\(error)); trying again, less and less often") }
-            setRetry(at: backoff.nextTry)
+            setRetry(at: nextOpen)
             return
         }
         do {
@@ -404,7 +534,7 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
         } catch {
             input.stop()
             if backoff.failed(at: Date()) == 1 { log?("capture: microphone failed to start: \(error); trying again, less and less often") }
-            setRetry(at: backoff.nextTry)
+            setRetry(at: nextOpen)
         }
     }
 
@@ -414,7 +544,8 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
         guard changed == generation, input != nil, wanted else { return }
         log?("capture: the Mac's input changed; opening it again")
         teardown()
-        setRetry(at: backoff.holdOffAfterStart(seconds: 1))
+        _ = backoff.holdOffAfterStart(seconds: 1)
+        setRetry(at: nextOpen)
     }
 
     /// While the microphone is open: a stopped engine is a change, and a host that hasn't asked for
