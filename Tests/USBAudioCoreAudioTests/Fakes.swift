@@ -124,6 +124,7 @@ final class FakeOutputs: @unchecked Sendable {
     private var built: [FakeOutput] = []
     private var asked: [Date] = []
     private var failing = false
+    private var failingToBuild = false
     /// Each start waits for this, when set.
     var gate: DispatchSemaphore?
     var changeWhileStarting = false
@@ -134,11 +135,18 @@ final class FakeOutputs: @unchecked Sendable {
         set { lock.withLock { failing = newValue } }
     }
 
-    func make(_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) -> any PlaybackOutput {
-        let fails = lock.withLock {
+    /// Building throws while set, as a connection that fails does on macOS 27.
+    var failToBuild: Bool {
+        get { lock.withLock { failingToBuild } }
+        set { lock.withLock { failingToBuild = newValue } }
+    }
+
+    func make(_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) throws -> any PlaybackOutput {
+        let (fails, failsToBuild) = lock.withLock {
             asked.append(Date())
-            return failing
+            return (failing, failingToBuild)
         }
+        if failsToBuild { throw FakeOutput.Failure() }
         let output = FakeOutput(ring: ring, changed: changed, gate: gate, changeWhileStarting: changeWhileStarting,
                                 fails: fails)
         lock.withLock { built.append(output) }
@@ -147,7 +155,7 @@ final class FakeOutputs: @unchecked Sendable {
 
     var all: [FakeOutput] { lock.withLock { built } }
 
-    /// When each output was asked for: the start attempts.
+    /// When each output was asked for, built or not: the start attempts.
     var attempts: [Date] { lock.withLock { asked } }
 }
 
@@ -191,6 +199,7 @@ final class FakeInputs: @unchecked Sendable {
     private var built: [FakeInput] = []
     private var asked: [Date] = []
     private var failing = false
+    private var failingToBuild = false
 
     /// Starts fail while set.
     var fail: Bool {
@@ -198,11 +207,19 @@ final class FakeInputs: @unchecked Sendable {
         set { lock.withLock { failing = newValue } }
     }
 
+    /// Building throws while set, as EngineCaptureInput's does for a format that isn't the device's or
+    /// a tap that can't be installed.
+    var failToBuild: Bool {
+        get { lock.withLock { failingToBuild } }
+        set { lock.withLock { failingToBuild = newValue } }
+    }
+
     func make(_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) throws -> any CaptureInput {
-        let fails = lock.withLock {
+        let (fails, failsToBuild) = lock.withLock {
             asked.append(Date())
-            return failing
+            return (failing, failingToBuild)
         }
+        if failsToBuild { throw FakeInput.Failure() }
         let input = FakeInput(ring: ring, changed: changed, fails: fails)
         lock.withLock { built.append(input) }
         return input
@@ -210,7 +227,7 @@ final class FakeInputs: @unchecked Sendable {
 
     var all: [FakeInput] { lock.withLock { built } }
 
-    /// When each input was asked for: the attempts to open the microphone.
+    /// When each input was asked for, built or not: the attempts to open the microphone.
     var attempts: [Date] { lock.withLock { asked } }
 }
 

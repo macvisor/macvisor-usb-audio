@@ -56,11 +56,11 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     private var backoff = StartBackoff()
 
     public convenience init(idleStop: TimeInterval = 30) {
-        self.init(idleStop: idleStop, bounds: .playback) { ring, changed in EnginePlaybackOutput(ring: ring, changed: changed) }
+        self.init(idleStop: idleStop, bounds: .playback) { ring, changed in try EnginePlaybackOutput(ring: ring, changed: changed) }
     }
 
     /// `makeOutput` builds an output reading `ring`, which calls `changed` when the Mac's output
-    /// device changes under it (tests pass a stand-in).
+    /// device changes under it, or throws when it can't be built (tests pass a stand-in).
     init(idleStop: TimeInterval, bounds: StereoRing.Bounds, makeOutput: @escaping MakePlaybackOutput) {
         self.idleStop = idleStop
         ring = StereoRing(capacitySeconds: 0.5, bounds: bounds)
@@ -156,20 +156,24 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         guard streaming, output == nil else { return }
         generation += 1
         let current = generation
-        // The output observes changes from before its start: a change while it starts isn't lost. The
-        // observer holds neither the output nor this object.
-        let output = makeOutput(ring) { [weak self] in
-            guard let self else { return }
-            queue.async { self.outputChanged(generation: current) }
-        }
-        ring.trimOnNextRead()
         do {
-            try output.start()
+            // The output observes changes from before its start: a change while it starts isn't lost. The
+            // observer holds neither the output nor this object.
+            let output = try makeOutput(ring) { [weak self] in
+                guard let self else { return }
+                queue.async { self.outputChanged(generation: current) }
+            }
+            ring.trimOnNextRead()
+            do {
+                try output.start()
+            } catch {
+                output.stop()
+                throw error
+            }
             self.output = output
             let after = backoff.succeeded(at: Date())
             log?("playback: output engine started (\(output.formatDescription))\(after > 0 ? " after \(after) failed attempt(s)" : "")")
         } catch {
-            output.stop()
             if backoff.failed(at: Date()) == 1 {
                 log?("playback: output engine failed to start: \(error); trying again, less and less often")
             }
@@ -270,8 +274,9 @@ protocol PlaybackOutput: AnyObject {
     func stop()
 }
 
-/// Builds an output reading `ring`, whose `changed` is called when the Mac's output device changes.
-typealias MakePlaybackOutput = (_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) -> any PlaybackOutput
+/// Builds an output reading `ring`, whose `changed` is called when the Mac's output device changes;
+/// throws when it can't be built.
+typealias MakePlaybackOutput = (_ ring: StereoRing, _ changed: @escaping @Sendable () -> Void) throws -> any PlaybackOutput
 
 /// An AVAudioEngine playing a ring on the Mac's default output.
 final class EnginePlaybackOutput: PlaybackOutput, @unchecked Sendable {
@@ -280,7 +285,7 @@ final class EnginePlaybackOutput: PlaybackOutput, @unchecked Sendable {
     private let lock = NSLock()
     private var stopped = false
 
-    init(ring: StereoRing, changed: @escaping @Sendable () -> Void) {
+    init(ring: StereoRing, changed: @escaping @Sendable () -> Void) throws {
         let format = AVAudioFormat(standardFormatWithSampleRate: Double(UAC1AudioDevice.sampleRate), channels: 2)!
         let source = AVAudioSourceNode(format: format) { _, _, frameCount, bufferList -> OSStatus in
             let buffers = UnsafeMutableAudioBufferListPointer(bufferList)
@@ -291,7 +296,18 @@ final class EnginePlaybackOutput: PlaybackOutput, @unchecked Sendable {
             return noErr
         }
         engine.attach(source)
+        // On macOS 27 a connection that fails throws, a failed start (5 Nov 2026): the older call
+        // raises an Objective-C exception, which takes the runner down. Swift 6.4 is the first with
+        // macOS 27's SDK; older ones build the older call.
+        #if compiler(>=6.4)
+        if #available(macOS 27, *) {
+            try engine.connectNode(source, to: engine.mainMixerNode, format: format)
+        } else {
+            engine.connect(source, to: engine.mainMixerNode, format: format)
+        }
+        #else
         engine.connect(source, to: engine.mainMixerNode, format: format)
+        #endif
         observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
                                                           object: engine, queue: nil) { _ in changed() }
     }
@@ -592,12 +608,15 @@ typealias MakeCaptureInput = (_ ring: StereoRing, _ changed: @escaping @Sendable
 
 /// An AVAudioEngine writing the Mac's default input to a ring, as 48 kHz stereo.
 final class EngineCaptureInput: CaptureInput, @unchecked Sendable {
-    /// The input's format, which can't be converted.
+    /// The input's format, which can't be tapped or converted.
     struct NoUsableInput: Error, CustomStringConvertible {
         let description: String
     }
 
     private let engine: AVAudioEngine
+    /// The engine's input node, kept: the engine's getter binds it to the Mac's input device through
+    /// coreaudiod, synchronously, and `stop` needn't do that again (5 Nov 2026).
+    private let input: AVAudioInputNode
     private let observer: any NSObjectProtocol
     private let lock = NSLock()
     private var stopped = false
@@ -607,35 +626,49 @@ final class EngineCaptureInput: CaptureInput, @unchecked Sendable {
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
-        guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
-              let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(UAC1AudioDevice.sampleRate), channels: 2, interleaved: true),
-              let converter = AVAudioConverter(from: inputFormat, to: target) else {
-            throw NoUsableInput(description: "\(inputFormat)")
+        let hardware = input.inputFormat(forBus: 0)
+        if let problem = Self.tapProblem(tap: (inputFormat.sampleRate, inputFormat.channelCount),
+                                         hardware: (hardware.sampleRate, hardware.channelCount)) {
+            throw NoUsableInput(description: "\(problem): \(inputFormat), the device's \(hardware)")
         }
-        if inputFormat.channelCount == 1 { converter.channelMap = [0, 0] } // mono microphone to both channels
+        guard let writer = TapWriter(from: inputFormat, to: ring) else { throw NoUsableInput(description: "\(inputFormat)") }
         // The tap's buffers are 100 ms whatever is asked (its range is 100–400 ms); the capture trim
-        // keeps one of them.
-        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { buffer, _ in
-            let capacity = AVAudioFrameCount(Double(buffer.frameLength) * target.sampleRate / inputFormat.sampleRate) + 32
-            guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
-            nonisolated(unsafe) var fed = false
-            _ = converter.convert(to: out, error: nil) { _, status in
-                if fed { status.pointee = .noDataNow; return nil }
-                fed = true
-                status.pointee = .haveData
-                return buffer
+        // keeps one of them. On macOS 27 a tap that can't be installed throws, a failed open (5 Nov
+        // 2026): the older call raises an Objective-C exception, which takes the runner down, for a
+        // format that isn't the device's (the Mac's input changed since the formats were read) or a
+        // second tap. Swift 6.4 is the first with macOS 27's SDK; older ones build the older call.
+        #if compiler(>=6.4)
+        if #available(macOS 27, *) {
+            try input.installAudioTap(onBus: 0, bufferSize: 512, format: inputFormat) { buffer, _ in
+                writer.write(AVAudioPCMBuffer(copying: buffer))
             }
-            if let data = out.floatChannelData?[0] {
-                ring.write(float: UnsafeBufferPointer(start: data, count: Int(out.frameLength) * 2))
-            }
+        } else {
+            input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { buffer, _ in writer.write(buffer) }
         }
+        #else
+        input.installTap(onBus: 0, bufferSize: 512, format: inputFormat) { buffer, _ in writer.write(buffer) }
+        #endif
         self.engine = engine
+        self.input = input
         formatDescription = "\(inputFormat)"
         observer = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
                                                           object: engine, queue: nil) { _ in changed() }
     }
 
     deinit { stop() }
+
+    /// What keeps the input's format (`tap`) from being tapped on the device's (`hardware`), each as
+    /// (sample rate, channels), or nil: both need a rate and channels, and the rates must be the same.
+    /// A Mac without an input device reports 0 Hz and no channels; a device that changes between the
+    /// two reads (an AirPods profile switch, a USB microphone unplugged, another rate) can report
+    /// another rate. A tap of such a format raised an Objective-C exception (5 Nov 2026).
+    static func tapProblem(tap: (rate: Double, channels: AVAudioChannelCount),
+                           hardware: (rate: Double, channels: AVAudioChannelCount)) -> String? {
+        guard tap.rate > 0, tap.channels > 0 else { return "no usable input format" }
+        guard hardware.rate > 0, hardware.channels > 0 else { return "no usable input device" }
+        guard tap.rate == hardware.rate else { return "the input's rate isn't the device's" }
+        return nil
+    }
 
     var isRunning: Bool { engine.isRunning }
 
@@ -644,7 +677,41 @@ final class EngineCaptureInput: CaptureInput, @unchecked Sendable {
     func stop() {
         guard lock.withLock({ () -> Bool in defer { stopped = true }; return !stopped }) else { return }
         NotificationCenter.default.removeObserver(observer)
-        engine.inputNode.removeTap(onBus: 0)
+        input.removeTap(onBus: 0)
         engine.stop()
+    }
+}
+
+/// Converts the tap's buffers to 48 kHz stereo and writes them to the ring. Used by the tap's thread
+/// only, a buffer at a time.
+private final class TapWriter: @unchecked Sendable {
+    private let converter: AVAudioConverter
+    private let target: AVAudioFormat
+    private let sourceRate: Double
+    private let ring: StereoRing
+
+    init?(from format: AVAudioFormat, to ring: StereoRing) {
+        guard let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(UAC1AudioDevice.sampleRate), channels: 2, interleaved: true),
+              let converter = AVAudioConverter(from: format, to: target) else { return nil }
+        if format.channelCount == 1 { converter.channelMap = [0, 0] } // mono microphone to both channels
+        self.converter = converter
+        self.target = target
+        sourceRate = format.sampleRate
+        self.ring = ring
+    }
+
+    func write(_ buffer: AVAudioPCMBuffer) {
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * target.sampleRate / sourceRate) + 32
+        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
+        nonisolated(unsafe) var fed = false
+        _ = converter.convert(to: out, error: nil) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true
+            status.pointee = .haveData
+            return buffer
+        }
+        if let data = out.floatChannelData?[0] {
+            ring.write(float: UnsafeBufferPointer(start: data, count: Int(out.frameLength) * 2))
+        }
     }
 }

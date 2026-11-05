@@ -70,7 +70,9 @@ audio at most:
 
 With `importTimeout` set, a connection that imports nothing within it is closed, so idle connections
 can't hold a server's places. `CoreAudioPlayback` and `CoreAudioCapture` follow a change of the Mac's
-output or input device, and stop their engines when they are freed.
+output or input device, and stop their engines when they are freed. On macOS 27 a tap or a
+connection that fails throws, where the older calls raised an Objective-C exception, and counts as a
+failed start.
 
 ## Try it
 

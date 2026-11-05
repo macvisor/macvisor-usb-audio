@@ -5,7 +5,7 @@ import Testing
 
 @Suite struct PlaybackLifecycleTests {
     private func playback(_ outputs: FakeOutputs, idleStop: TimeInterval = 30) -> CoreAudioPlayback {
-        CoreAudioPlayback(idleStop: idleStop, bounds: .playback) { outputs.make($0, $1) }
+        CoreAudioPlayback(idleStop: idleStop, bounds: .playback) { try outputs.make($0, $1) }
     }
 
     /// A runner drops its USB audio after a restart with other settings, and the Mac's audio stops

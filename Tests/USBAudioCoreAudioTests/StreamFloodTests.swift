@@ -13,7 +13,7 @@ import Testing
     private static let toggles = 10_000
 
     private func playback(_ outputs: FakeOutputs, idleStop: TimeInterval = 30) -> CoreAudioPlayback {
-        CoreAudioPlayback(idleStop: idleStop, bounds: .playback) { outputs.make($0, $1) }
+        CoreAudioPlayback(idleStop: idleStop, bounds: .playback) { try outputs.make($0, $1) }
     }
 
     private func capture(_ inputs: FakeInputs) -> CoreAudioCapture {
@@ -154,5 +154,59 @@ import Testing
         #expect(attempts.count >= 1 && attempts.count <= attemptsAllowed(in: elapsed))
         #expect(pausesHeld(attempts) { 0.5 * pow(2, Double($0 - 1)) })
         #expect(!source.isOpen)
+    }
+
+    /// A tap that can't be installed (a format that isn't the device's, which on macOS 27 throws where
+    /// the older call raised an exception) is a failed open: tried again after the pause, at the host's
+    /// requests, and open once it can be.
+    @Test func aTapThatCantBeInstalledIsAFailedOpenTriedAgainLater() {
+        let inputs = FakeInputs()
+        inputs.failToBuild = true
+        let source = capture(inputs)
+        source.captureStarted()
+        source.waitForQueue()
+        #expect(!source.isOpen && inputs.attempts.count == 1 && inputs.all.isEmpty)
+        // Requests within the first pause (0.5 s from the failure) try nothing.
+        let start = Date()
+        while Date().timeIntervalSince(start) < 0.2 {
+            _ = source.captureAudio(byteCount: 192)
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+        source.waitForQueue()
+        #expect(inputs.attempts.count <= attemptsAllowed(in: Date().timeIntervalSince(start) + 0.05))
+        inputs.failToBuild = false
+        let open = eventually(within: 5) {
+            _ = source.captureAudio(byteCount: 192)
+            return source.isOpen
+        }
+        #expect(open && inputs.all.count == 1)
+    }
+
+    /// The same for an output whose connection fails (macOS 27 throws there too).
+    @Test func anOutputThatCantBeBuiltIsAFailedStartTriedAgainLater() {
+        let outputs = FakeOutputs()
+        outputs.failToBuild = true
+        let sink = playback(outputs)
+        sink.playbackStarted()
+        sink.waitForQueue()
+        #expect(outputs.attempts.count == 1 && outputs.all.isEmpty)
+        outputs.failToBuild = false
+        let started = eventually(within: 5) {
+            sink.play(Data(count: 1920))
+            return outputs.all.first?.isRunning ?? false
+        }
+        #expect(started && outputs.all.count == 1)
+    }
+
+    /// What EngineCaptureInput won't tap: a tap whose rate isn't the device's raised an exception.
+    @Test func aTapNeedsAFormatAtTheDevicesRate() {
+        #expect(EngineCaptureInput.tapProblem(tap: (48000, 2), hardware: (48000, 2)) == nil)
+        #expect(EngineCaptureInput.tapProblem(tap: (48000, 1), hardware: (48000, 1)) == nil)
+        #expect(EngineCaptureInput.tapProblem(tap: (48000, 2), hardware: (48000, 1)) == nil) // channels can differ
+        #expect(EngineCaptureInput.tapProblem(tap: (0, 0), hardware: (0, 0)) != nil) // no input device
+        #expect(EngineCaptureInput.tapProblem(tap: (48000, 2), hardware: (0, 0)) != nil)
+        #expect(EngineCaptureInput.tapProblem(tap: (48000, 0), hardware: (48000, 2)) != nil)
+        #expect(EngineCaptureInput.tapProblem(tap: (48000, 1), hardware: (16000, 1)) != nil) // an AirPods switch
+        #expect(EngineCaptureInput.tapProblem(tap: (44100, 2), hardware: (48000, 2)) != nil)
     }
 }

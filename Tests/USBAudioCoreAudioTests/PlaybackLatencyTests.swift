@@ -49,7 +49,7 @@ final class PlaybackSimulation {
         let outputs = outputs
         let gate = gate
         outputs.gate = gate
-        playback = CoreAudioPlayback(idleStop: 30, bounds: .playback) { outputs.make($0, $1) }
+        playback = CoreAudioPlayback(idleStop: 30, bounds: .playback) { try outputs.make($0, $1) }
         pacer = EndpointPacer(lead: 0.04, clock: clock)
         origin = clock.now()
         nextSteer = origin + 250_000_000
