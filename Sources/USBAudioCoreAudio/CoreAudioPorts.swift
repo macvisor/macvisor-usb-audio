@@ -11,8 +11,8 @@ import USBAudioDevice
 ///
 /// A change of the Mac's output (AirPods connecting, a USB DAC, another default device) stops an
 /// AVAudioEngine and posts `AVAudioEngineConfigurationChange`: the engine is built again on the new
-/// device. An engine that fails to start is tried again after a growing pause (`StartBackoff`), not at
-/// every URB.
+/// device, at most once a second (a headset switching profiles posts several in a row). An engine
+/// that fails to start is tried again after a growing pause (`StartBackoff`), not at every URB.
 public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     public var log: (@Sendable (String) -> Void)?
 
@@ -71,7 +71,7 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
             try engine.start()
             self.engine = engine
             observeConfiguration(of: engine)
-            let after = backoff.succeeded()
+            let after = backoff.succeeded(at: Date())
             log?("playback: output engine started (\(engine.outputNode.outputFormat(forBus: 0)))\(after > 0 ? " after \(after) failed attempt(s)" : "")")
         } catch {
             if backoff.failed(at: Date()) == 1 {
@@ -89,8 +89,11 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
                 guard self.engine === engine else { return }
                 self.log?("playback: the Mac's output changed; starting the engine on it again")
                 self.teardown()
-                self.backoff = StartBackoff()
-                self.startEngine()
+                // Not before a second after the last start; failures keep their pause.
+                let at = self.backoff.holdOffAfterStart(seconds: 1)
+                self.queue.asyncAfter(deadline: .now() + max(0, at.timeIntervalSinceNow)) {
+                    if self.engine == nil, self.backoff.mayTry(at: Date()) { self.startEngine() }
+                }
             }
         }
     }
@@ -110,11 +113,12 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     }
 }
 
-/// When to try starting an audio engine again after it failed: at once the first time, then after
-/// 0.5, 1, 2… seconds, up to 30.
+/// When to try starting an audio engine again: after a failure at once the first time, then after
+/// 0.5, 1, 2… seconds, up to 30; after a device change not sooner than a second after the last start.
 struct StartBackoff {
     private(set) var failures = 0
     private var next: Date?
+    private var lastStart: Date?
 
     func mayTry(at now: Date) -> Bool { next.map { now >= $0 } ?? true }
 
@@ -126,16 +130,25 @@ struct StartBackoff {
     }
 
     /// The engine started; returns the failures before it.
-    mutating func succeeded() -> Int {
-        defer { failures = 0; next = nil }
+    mutating func succeeded(at now: Date) -> Int {
+        defer { failures = 0; next = nil; lastStart = now }
         return failures
+    }
+
+    /// A device change: the next start waits until `seconds` after the last one (and any failure's
+    /// pause). Returns when it may be.
+    mutating func holdOffAfterStart(seconds: TimeInterval) -> Date {
+        let floor = lastStart.map { $0.addingTimeInterval(seconds) } ?? .distantPast
+        next = max(next ?? .distantPast, floor)
+        return next ?? floor
     }
 }
 
 /// Feeds the Mac's default input device to the device's microphone stream, **only while the host
 /// records** (the microphone opens on `captureStarted` and closes on `captureStopped`), so macOS's
 /// microphone indicator and its permission prompt mean what they say. A change of the Mac's input
-/// while the host records opens the new one.
+/// while the host records opens the new one (at most once a second); a microphone that fails to open
+/// is tried again, with the same growing pause as playback, while the host still records.
 public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     public var log: (@Sendable (String) -> Void)?
 
@@ -143,21 +156,39 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     private let queue = DispatchQueue(label: "usb-audio.coreaudio.capture")
     private var engine: AVAudioEngine?
     private var configurationObserver: NSObjectProtocol?
+    /// On the queue: whether the host records, and the start pauses.
+    private var wanted = false
+    private var backoff = StartBackoff()
+    /// Read on the server's thread: a start is due (the host records, no engine runs).
+    private let retryLock = NSLock()
+    private var retryDue = false
     private let targetFrames = UAC1AudioDevice.sampleRate * 40 / 1000
     private let trimFrames = UAC1AudioDevice.sampleRate * 150 / 1000
 
     public init() {}
 
     public func captureStarted() {
-        queue.async { self.startEngine() }
+        queue.async {
+            self.wanted = true
+            self.backoff = StartBackoff()
+            self.startEngine()
+        }
     }
 
     public func captureStopped() {
         queue.async {
+            self.wanted = false
+            self.setRetryDue(false)
             self.teardown()
             self.ring.clear()
             self.log?("capture: microphone closed")
         }
+    }
+
+    private func setRetryDue(_ due: Bool) {
+        retryLock.lock()
+        retryDue = due
+        retryLock.unlock()
     }
 
     private func teardown() {
@@ -169,18 +200,28 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
     }
 
     public func captureAudio(byteCount: Int) -> Data {
-        ring.readInt16(frames: byteCount / UAC1AudioDevice.bytesPerFrame, trimAboveFrames: trimFrames, keepFrames: targetFrames).0
+        retryLock.lock()
+        let due = retryDue
+        retryLock.unlock()
+        if due {
+            queue.async {
+                if self.wanted, self.engine == nil, self.backoff.mayTry(at: Date()) { self.startEngine() }
+            }
+        }
+        return ring.readInt16(frames: byteCount / UAC1AudioDevice.bytesPerFrame, trimAboveFrames: trimFrames, keepFrames: targetFrames).0
     }
 
+    /// On the queue.
     private func startEngine() {
-        guard engine == nil else { return }
+        guard wanted, engine == nil else { return }
         let engine = AVAudioEngine()
         let input = engine.inputNode
         let inputFormat = input.outputFormat(forBus: 0)
         guard inputFormat.sampleRate > 0, inputFormat.channelCount > 0,
               let target = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: Double(UAC1AudioDevice.sampleRate), channels: 2, interleaved: true),
               let converter = AVAudioConverter(from: inputFormat, to: target) else {
-            log?("capture: no usable input device (\(inputFormat))")
+            if backoff.failed(at: Date()) == 1 { log?("capture: no usable input device (\(inputFormat)); trying again, less and less often") }
+            setRetryDue(true)
             return
         }
         if inputFormat.channelCount == 1 { converter.channelMap = [0, 0] } // mono microphone to both channels
@@ -202,6 +243,8 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
         do {
             try engine.start()
             self.engine = engine
+            setRetryDue(false)
+            let after = backoff.succeeded(at: Date())
             configurationObserver = NotificationCenter.default.addObserver(forName: .AVAudioEngineConfigurationChange,
                                                                            object: engine, queue: nil) { [weak self] _ in
                 guard let self else { return }
@@ -209,13 +252,16 @@ public final class CoreAudioCapture: CaptureSource, @unchecked Sendable {
                     guard self.engine === engine else { return }
                     self.log?("capture: the Mac's input changed; opening it again")
                     self.teardown()
-                    self.startEngine()
+                    // Not before a second after the last start; the next captured URB does it.
+                    _ = self.backoff.holdOffAfterStart(seconds: 1)
+                    self.setRetryDue(true)
                 }
             }
-            log?("capture: microphone open (\(inputFormat))")
+            log?("capture: microphone open (\(inputFormat))\(after > 0 ? " after \(after) failed attempt(s)" : "")")
         } catch {
             input.removeTap(onBus: 0)
-            log?("capture: microphone failed to start: \(error)")
+            if backoff.failed(at: Date()) == 1 { log?("capture: microphone failed to start: \(error); trying again, less and less often") }
+            setRetryDue(true)
         }
     }
 }
