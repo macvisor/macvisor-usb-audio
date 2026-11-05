@@ -122,9 +122,11 @@ import Testing
     /// A paused VM asks for no audio: the microphone closes, and opens again, once, when it asks.
     @Test func theMicrophoneClosesWhenTheHostStopsAskingAndOpensWhenItAsks() {
         let inputs = FakeInputs()
-        let source = capture(inputs, idleClose: 0.2)
+        // A gap of 0.5 s closes it: a URB every 10 ms keeps it open even on a slow CI Mac, and the close
+        // still comes well within `eventually`'s 2 s.
+        let source = capture(inputs, idleClose: 0.5)
         source.captureStarted()
-        for _ in 0 ..< 30 { // 0.3 s of a recording host: stays open
+        for _ in 0 ..< 30 { // 0.3 s or more of a recording host: stays open
             _ = source.captureAudio(byteCount: 1920)
             Thread.sleep(forTimeInterval: 0.01)
         }
@@ -147,7 +149,10 @@ import Testing
         source.captureStarted()
         source.waitForQueue()
         #expect(inputs.all.count == 1)
-        for _ in 0 ..< 30 { // 0.3 s: within the first pause (0.5 s)
+        // URBs for 0.25 s by the clock, well within the first pause (0.5 s from the failure, which came
+        // before this): a count of loops took longer than the pause on a slow CI Mac.
+        let start = Date()
+        while Date().timeIntervalSince(start) < 0.25 {
             _ = source.captureAudio(byteCount: 1920)
             Thread.sleep(forTimeInterval: 0.01)
         }
