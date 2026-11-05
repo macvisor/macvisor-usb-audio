@@ -75,11 +75,15 @@ output or input device, and stop their engines when they are freed.
 swift run macvisor-usb-audio-server --listen 127.0.0.1:3240
 ```
 
-The server plays what the guest plays on your default output, and gives the guest your default
-microphone while it records.
+The server plays what the guest plays on your default output. The guest's microphone is silent
+unless you ask: whoever reaches the server would hear it.
+- `--microphone` gives the guest your default microphone while it records.
 - `--tone` sends a test tone as the microphone instead.
 - `--loopback` sends the guest's own playback back as its microphone (latency tests).
 - `--record file.wav` writes playback to a file.
+
+It serves four connections at once at most, closes one that imports nothing within 10 seconds, and
+warns when it listens on an address other than loopback.
 
 In a Windows guest with usbip-win2 installed, reach the server on its address. An SSH reverse tunnel
 (`ssh -R 127.0.0.1:3240:127.0.0.1:3240 <guest>`) avoids opening a port on the Mac. Then:
