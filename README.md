@@ -55,6 +55,16 @@ listening.
 can't present it to the guest twice. After a VM is restored, its old connections are dead without
 anyone noticing: call `disconnectAll()` first.
 
+**Bounded by the device, not the client.** Whatever a client sends, the server holds a few seconds of
+audio at most:
+- transfers longer than the device ever needs end the session;
+- isochronous packets longer than twice wMaxPacketSize, or summing past their buffer, stall;
+- each endpoint queues at most 64 URBs, reaching at most 2 s ahead, and stalls the rest.
+
+With `importTimeout` set, a connection that imports nothing within it is closed, so idle connections
+can't hold a server's places. `CoreAudioPlayback` and `CoreAudioCapture` follow a change of the Mac's
+output or input device.
+
 ## Try it
 
 ```sh
@@ -83,9 +93,11 @@ import USBAudioDevice
 import USBAudioCoreAudio
 
 let server = USBAudioServer(playback: CoreAudioPlayback(), capture: CoreAudioCapture())
-// For each connection, e.g. a VZVirtioSocketConnection accepted by a VZVirtioSocketListener:
+server.importTimeout = 10
+// For each connection, e.g. a VZVirtioSocketConnection accepted by a VZVirtioSocketListener. The
+// stream gets a duplicate of the descriptor, which it closes itself once nothing uses it.
 Thread.detachNewThread {
-    server.serve(FileDescriptorStream(fileDescriptor: connection.fileDescriptor, ownsDescriptor: false))
+    server.serve(FileDescriptorStream(fileDescriptor: dup(connection.fileDescriptor)))
 }
 ```
 

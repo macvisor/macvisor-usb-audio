@@ -10,6 +10,10 @@ import Foundation
 /// - **Isochronous URBs complete in submission order**, paced by an `EndpointPacer` per endpoint.
 /// - **Unlink as Linux defines it.** A pending URB that is unlinked gets USBIP_RET_UNLINK
 ///   (-ECONNRESET) and never a USBIP_RET_SUBMIT; one that already completed gets RET_UNLINK status 0.
+/// - **Bounded by the device, not the host.** Transfers longer than `UAC1AudioDevice.maxTransferLength`
+///   end the session; isochronous packets longer than `packetLimit`, or summing past their buffer,
+///   stall; and URBs beyond what a pacer queues stall at once. Whatever the host sends, the server
+///   holds a few seconds of audio at most.
 public final class USBAudioServer: @unchecked Sendable {
     public let busID: String
     public let device: UAC1AudioDevice
@@ -23,6 +27,10 @@ public final class USBAudioServer: @unchecked Sendable {
     private let clock: PacerClock
     private let lock = NSLock()
     private var session: Session?
+
+    /// How long a connection may take to import the device (or ask for the device list) before it is
+    /// closed, so idle connections can't hold the server's places; nil waits forever.
+    public var importTimeout: TimeInterval?
 
     /// - Parameters:
     ///   - lead: how far ahead of real time playback URBs complete (absorbs transport jitter).
@@ -71,6 +79,9 @@ public final class USBAudioServer: @unchecked Sendable {
     public func serve(_ stream: ByteStream) {
         defer { stream.close() }
         do {
+            // Until the device is imported, a silent connection ends at `importTimeout`; an imported
+            // device's stream is idle whenever nothing plays, so the timeout ends with the import.
+            stream.setReadTimeout(importTimeout)
             switch try USBIP.readOperation(from: stream) {
             case USBIP.OpCode.requestDeviceList.rawValue:
                 try stream.write(USBIP.encodeDeviceList([device.exportedDevice(busID: busID)]))
@@ -87,6 +98,7 @@ public final class USBAudioServer: @unchecked Sendable {
                     return
                 }
                 defer { release(s) } // registered before any write that could fail
+                stream.setReadTimeout(nil)
                 try stream.write(USBIP.encodeImportReply(device.exportedDevice(busID: busID)))
                 log?("device \(busID) attached")
                 try run(s)
@@ -94,6 +106,8 @@ public final class USBAudioServer: @unchecked Sendable {
                 throw USBIP.ProtocolError.unexpectedOperation(other)
             }
         } catch StreamError.closed {
+        } catch StreamError.timedOut {
+            log?("connection closed: nothing imported within \(importTimeout ?? 0) s")
         } catch {
             log?("connection ended: \(error)")
         }
@@ -114,6 +128,8 @@ public final class USBAudioServer: @unchecked Sendable {
         }
 
         var steering: DispatchSourceTimer?
+        /// Whether this session already logged a refused URB (the first is said, not the rest).
+        var saidRefused = false
 
         func send(_ data: Data) {
             writeLock.lock()
@@ -171,7 +187,7 @@ public final class USBAudioServer: @unchecked Sendable {
 
     private func run(_ s: Session) throws {
         while true {
-            switch try USBIP.readCommand(from: s.stream) {
+            switch try USBIP.readCommand(from: s.stream, maxTransferLength: UAC1AudioDevice.maxTransferLength) {
             case .submit(let urb):
                 submit(urb, in: s)
             case .unlink(let u):
@@ -201,8 +217,11 @@ public final class USBAudioServer: @unchecked Sendable {
         }
 
         if urb.isIsochronous, urb.endpoint == playbackEndpoint, urb.direction == .out {
+            guard urb.isoPackets.allSatisfy({ Int($0.length) <= UAC1AudioDevice.packetLimit }) else {
+                return refuse(urb, in: s, "a playback packet longer than \(UAC1AudioDevice.packetLimit) bytes")
+            }
             let frames = urb.outData.count / UAC1AudioDevice.bytesPerFrame
-            s.playbackPacer.enqueue(id: urb.sequence, frameCount: frames) { [device, playback] in
+            let queued = s.playbackPacer.enqueue(id: urb.sequence, frameCount: frames) { [device, playback] in
                 // Windows may send the first URB around SET_INTERFACE: accept it either way.
                 if device.isPlaybackActive { playback.play(device.applyGain(.playback, to: urb.outData)) }
                 let packets = urb.isoPackets.map { IsoPacket(offset: $0.offset, length: $0.length, actualLength: $0.length) }
@@ -210,22 +229,43 @@ public final class USBAudioServer: @unchecked Sendable {
                                                actualLength: UInt32(urb.outData.count), startFrame: urb.startFrame,
                                                isoPackets: packets))
             }
+            if !queued { refuse(urb, in: s, "more playback queued than the device holds") }
             return
         }
 
         if urb.isIsochronous, urb.endpoint == captureEndpoint, urb.direction == .in {
+            // Each packet within the device's limit, and all of them within the buffer: the reply's
+            // data is the packets back to back, so their sum is what the server allocates.
             let total = urb.isoPackets.reduce(0) { $0 + Int($1.length) }
-            s.capturePacer.enqueue(id: urb.sequence, frameCount: total / UAC1AudioDevice.bytesPerFrame) { [device, capture] in
+            guard urb.isoPackets.allSatisfy({ Int($0.length) <= UAC1AudioDevice.packetLimit }),
+                  total <= Int(urb.transferBufferLength) else {
+                return refuse(urb, in: s, "capture packets past the device's limit or their buffer")
+            }
+            let queued = s.capturePacer.enqueue(id: urb.sequence, frameCount: total / UAC1AudioDevice.bytesPerFrame) { [device, capture] in
                 let audio = device.isCaptureActive ? device.applyGain(.capture, to: capture.captureAudio(byteCount: total)) : Data(count: total)
                 // Every packet full, so the packed data is the packets back to back.
                 let packets = urb.isoPackets.map { IsoPacket(offset: $0.offset, length: $0.length, actualLength: $0.length) }
                 s.send(USBIP.encodeSubmitReply(sequence: urb.sequence, status: USBIP.Status.ok, actualLength: UInt32(total),
                                                startFrame: urb.startFrame, isoPackets: packets, data: audio))
             }
+            if !queued { refuse(urb, in: s, "more capture queued than the device holds") }
             return
         }
 
         // Anything else: stall.
+        stall(urb, in: s)
+    }
+
+    /// Stalls a URB the device won't take, saying why the first time in a session.
+    private func refuse(_ urb: SubmitRequest, in s: Session, _ reason: String) {
+        if !s.saidRefused {
+            s.saidRefused = true
+            log?("refused a URB from the host: \(reason) (later ones aren't logged)")
+        }
+        stall(urb, in: s)
+    }
+
+    private func stall(_ urb: SubmitRequest, in s: Session) {
         let packets = urb.isIsochronous ? urb.isoPackets.map { IsoPacket(offset: $0.offset, length: $0.length, actualLength: 0, status: USBIP.Status.stall) } : nil
         s.send(USBIP.encodeSubmitReply(sequence: urb.sequence, status: USBIP.Status.stall, actualLength: 0,
                                        startFrame: urb.startFrame, isoPackets: packets, errorCount: UInt32(packets?.count ?? 0)))

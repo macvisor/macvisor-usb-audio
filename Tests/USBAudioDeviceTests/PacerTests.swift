@@ -14,6 +14,27 @@ import Testing
         #expect(order.value == Array(1 ... 20))
     }
 
+    @Test func refusesURBsPastItsQueueBound() {
+        let clock = ManualClock()
+        let pacer = EndpointPacer(lead: 0, maxQueuedURBs: 4, clock: clock)
+        for id in UInt32(1) ... 4 { #expect(pacer.enqueue(id: id, frameCount: 480) {}) }
+        #expect(!pacer.enqueue(id: 5, frameCount: 480) {})
+        #expect(pacer.statistics.refusedURBs == 1)
+        clock.advance(milliseconds: 10) // one completes: there's room again
+        #expect(pacer.enqueue(id: 6, frameCount: 480) {})
+    }
+
+    @Test func refusesAudioReachingTooFarAhead() {
+        let clock = ManualClock()
+        let pacer = EndpointPacer(lead: 0, maxQueuedURBs: 1000, maxAhead: 0.5, clock: clock)
+        for id in UInt32(1) ... 50 { #expect(pacer.enqueue(id: id, frameCount: 480) {}) } // up to 500 ms
+        #expect(!pacer.enqueue(id: 51, frameCount: 480) {})
+        // Any frame count, however large, is refused, not trapped on.
+        #expect(!pacer.enqueue(id: 52, frameCount: Int.max) {})
+        #expect(!pacer.enqueue(id: 53, frameCount: -1) {})
+        #expect(pacer.statistics.refusedURBs == 3)
+    }
+
     @Test func runsEachURBWhenItsAudioIsDue() {
         let clock = ManualClock()
         let pacer = EndpointPacer(lead: 0, clock: clock)
@@ -86,7 +107,8 @@ import Testing
 
     @Test func rateAdjustmentSteersTheTimeline() {
         let clock = ManualClock()
-        let pacer = EndpointPacer(lead: 0, clock: clock)
+        // A second of audio queued at once: past the default bounds, which aren't what this tests.
+        let pacer = EndpointPacer(lead: 0, maxQueuedURBs: 200, maxAhead: 5, clock: clock)
         pacer.setRateAdjustment(ppm: 10_000) // 1% fast
         let last = Locked<UInt64>(0)
         for id in UInt32(1) ... 100 { pacer.enqueue(id: id, frameCount: 480) { last.mutate { $0 = clock.now() } } }

@@ -235,7 +235,9 @@ extension USBIP {
     }
 
     /// Reads one USBIP_CMD_SUBMIT or USBIP_CMD_UNLINK, validating every length before reading data.
-    public static func readCommand(from stream: ByteStream) throws -> ClientCommand {
+    /// - Parameter maxTransferLength: the longest transfer accepted (the device's own limit, at most
+    ///   the protocol's).
+    public static func readCommand(from stream: ByteStream, maxTransferLength: Int = USBIP.maxTransferLength) throws -> ClientCommand {
         var r = BigEndianReader(try stream.read(exactly: 48))
         let command = r.u32(), sequence = r.u32(), deviceID = r.u32(), directionRaw = r.u32(), endpoint = r.u32()
         switch command {

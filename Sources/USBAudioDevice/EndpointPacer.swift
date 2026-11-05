@@ -36,12 +36,17 @@ public struct DispatchClock: PacerClock {
 ///   transport jitter. A URB that arrives late completes at once, and the host catches up.
 /// - `setRateAdjustment(ppm:)` lets the audio output's clock steer the timeline, so the guest follows
 ///   the Mac's audio hardware instead of drifting against it.
+/// - **Bounded:** at most `maxQueuedURBs` URBs wait, reaching at most `maxAhead` into the future; a host
+///   that submits faster than real time (Windows keeps about two 10 ms URBs in flight) is refused, so it
+///   can't make the pacer hold an unbounded amount of audio.
 public final class EndpointPacer: @unchecked Sendable {
     public struct Statistics: Equatable, Sendable {
         /// URBs that arrived after their audio was due.
         public var lateURBs = 0
         public var completedURBs = 0
         public var timelineRestarts = 0
+        /// URBs `enqueue` refused (past the queue's bounds).
+        public var refusedURBs = 0
     }
 
     private struct Job {
@@ -49,6 +54,10 @@ public final class EndpointPacer: @unchecked Sendable {
         let due: UInt64
         let work: @Sendable () -> Void
     }
+
+    /// The most URBs that may wait at once, and how far ahead of now the queued audio may reach.
+    public let maxQueuedURBs: Int
+    public let maxAhead: TimeInterval
 
     private let nominalRate: Double
     private let lead: UInt64
@@ -70,10 +79,14 @@ public final class EndpointPacer: @unchecked Sendable {
     ///   - framesPerSecond: the stream's nominal sample rate.
     ///   - lead: how early URBs complete (playback); zero for capture.
     ///   - idleReset: a gap after the last queued audio that starts a new timeline.
+    ///   - maxQueuedURBs, maxAhead: the bounds above which `enqueue` refuses a URB.
     public init(framesPerSecond: Double = 48000, lead: TimeInterval = 0, idleReset: TimeInterval = 0.2,
+                maxQueuedURBs: Int = 64, maxAhead: TimeInterval = 2,
                 clock: PacerClock = DispatchClock(), label: String = "usb-audio.pacer") {
         nominalRate = framesPerSecond
         rate = framesPerSecond
+        self.maxQueuedURBs = maxQueuedURBs
+        self.maxAhead = maxAhead
         self.lead = UInt64(lead * 1e9)
         self.idleReset = UInt64(idleReset * 1e9)
         lateTolerance = 5_000_000
@@ -88,12 +101,24 @@ public final class EndpointPacer: @unchecked Sendable {
     }
 
     /// Queues a URB carrying `frameCount` frames. `work` runs once, after every earlier URB's, when the
-    /// URB is due. It runs on the pacer's queue.
-    public func enqueue(id: UInt32, frameCount: Int, work: @escaping @Sendable () -> Void) {
+    /// URB is due. It runs on the pacer's queue. False, and nothing queued, when the URB would go past
+    /// `maxQueuedURBs` or reach more than `maxAhead` into the future.
+    @discardableResult
+    public func enqueue(id: UInt32, frameCount: Int, work: @escaping @Sendable () -> Void) -> Bool {
         lock.lock()
         defer { lock.unlock() }
         let now = clock.now()
-        if anchorTime == nil || now > time(ofFrame: frames) &+ idleReset {
+        // A URB longer than the whole look-ahead never fits; refusing it first keeps the frame count
+        // (the host's to choose) out of the timeline's arithmetic.
+        guard jobs.count < maxQueuedURBs, frameCount >= 0, Double(frameCount) <= maxAhead * rate else {
+            stats.refusedURBs += 1
+            return false
+        }
+        let restarts = anchorTime == nil || now > time(ofFrame: frames) &+ idleReset
+        // Where this URB's audio would end, on the current timeline or a new one.
+        let wouldEnd = restarts ? now &+ duration(ofFrames: Int64(frameCount)) : time(ofFrame: frames + Int64(frameCount))
+        guard wouldEnd <= now &+ UInt64(maxAhead * 1e9) else { stats.refusedURBs += 1; return false }
+        if restarts {
             if anchorTime != nil { stats.timelineRestarts += 1 }
             anchorTime = now
             anchorFrames = 0
@@ -105,6 +130,7 @@ public final class EndpointPacer: @unchecked Sendable {
         let due = end > lead ? end - lead : 0
         jobs.append(Job(id: id, due: due, work: work))
         if !armed { arm() }
+        return true
     }
 
     /// Removes a URB that hasn't completed yet. False if it already ran, is running, or is unknown.
@@ -142,7 +168,14 @@ public final class EndpointPacer: @unchecked Sendable {
     /// When frame `n` of the current timeline is due (the lock is held).
     private func time(ofFrame n: Int64) -> UInt64 {
         guard let anchor = anchorTime else { return 0 }
-        return anchor &+ UInt64(max(0, Double(n - anchorFrames)) / rate * 1e9)
+        return anchor &+ duration(ofFrames: n - anchorFrames)
+    }
+
+    /// How long `n` frames last at the current rate, in nanoseconds; clamped, so no frame count (the
+    /// host's to choose) can trap the conversion.
+    private func duration(ofFrames n: Int64) -> UInt64 {
+        let nanoseconds = max(0, Double(n)) / rate * 1e9
+        return nanoseconds.isFinite ? UInt64(min(nanoseconds, Double(UInt64.max >> 2))) : UInt64.max >> 2
     }
 
     /// Arms a timer for the head job (the lock is held).

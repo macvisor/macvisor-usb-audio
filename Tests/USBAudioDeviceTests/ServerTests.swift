@@ -103,6 +103,81 @@ import Testing
         #expect(muted == Data(count: 1920))
     }
 
+    @Test func capturePacketsSummingPastTheirBufferStall() throws {
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource(), lead: 0)
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        try configure(client, playback: false, capture: true)
+        // 1024 packets of 192 bytes, all at offset 0 of a 192-byte buffer: each within it, the sum
+        // (192 KiB, or a gigabyte with longer packets) not.
+        try client.submit(direction: 1, endpoint: 2, length: 192, isoLengths: Array(repeating: 192, count: 1024), overlapping: true)
+        guard case .submit(_, let status, let actual, _, let data) = try client.readReply() else { Issue.record("no reply"); return }
+        #expect(status == USBIP.Status.stall && actual == 0 && data.isEmpty)
+        #expect(server.isAttached) // refused, not fatal
+    }
+
+    @Test func aCapturePacketPastTheDeviceLimitStalls() throws {
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource(), lead: 0)
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        try configure(client, playback: false, capture: true)
+        try client.submit(direction: 1, endpoint: 2, isoLengths: [UInt32(UAC1AudioDevice.packetLimit + 1)])
+        guard case .submit(_, let status, _, _, _) = try client.readReply() else { Issue.record("no reply"); return }
+        #expect(status == USBIP.Status.stall)
+    }
+
+    @Test func playbackPastWhatThePacerHoldsStalls() throws {
+        // Nothing completes while the clock stands still: the 64 URBs the pacer holds stay queued,
+        // and the ones past them are refused at once.
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource(), lead: 0, clock: ManualClock())
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        try configure(client)
+        for value in Int16(1) ... 70 {
+            try client.submit(direction: 0, endpoint: 1, outData: pcm(value: value, frames: 480), isoLengths: Array(repeating: 192, count: 10))
+        }
+        for _ in 1 ... 6 {
+            guard case .submit(_, let status, _, _, _) = try client.readReply() else { Issue.record("no reply"); return }
+            #expect(status == USBIP.Status.stall)
+        }
+        #expect(server.statistics?.playback.refusedURBs == 6)
+    }
+
+    @Test func aTransferPastTheDeviceLimitEndsTheSession() throws {
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource())
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        // The header claims more than the device ever takes; the server stops before reading it.
+        try client.send(ClientMessages.submit(sequence: 1, direction: 0, endpoint: 1,
+                                              length: UInt32(UAC1AudioDevice.maxTransferLength + 4), isoLengths: nil))
+        #expect(waitUntil { !server.isAttached })
+    }
+
+    @Test func aSilentConnectionIsClosedAtTheImportTimeout() throws {
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource())
+        server.importTimeout = 0.2
+        let client = TestClient()
+        client.stream.setReadTimeout(3) // a server that never closes fails the test instead of hanging it
+        startServing(server, client)
+        #expect(throws: StreamError.closed) { _ = try client.stream.read(exactly: 1) }
+    }
+
+    @Test func anImportedDeviceOutlivesTheImportTimeout() throws {
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource())
+        server.importTimeout = 0.2
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        Thread.sleep(forTimeInterval: 0.5)
+        #expect(server.isAttached)
+        let (status, descriptor) = try client.control(SetupPacket(requestType: 0x80, request: 0x06, value: 0x0100, index: 0, length: 64))
+        #expect(status == 0 && descriptor.count == 18)
+    }
+
     @Test func otherEndpointsStall() throws {
         let server = USBAudioServer(playback: NullSink(), capture: SilentSource())
         let client = TestClient()

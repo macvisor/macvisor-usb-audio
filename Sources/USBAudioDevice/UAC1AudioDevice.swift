@@ -77,6 +77,14 @@ public final class UAC1AudioDevice: @unchecked Sendable {
     public static let bytesPerFrame = 4
     /// Frames in one 1 ms full-speed packet.
     public static let framesPerPacket = sampleRate / 1000
+    /// The endpoints' wMaxPacketSize: one packet's audio, 192 bytes.
+    public static let maxPacketBytes = framesPerPacket * bytesPerFrame
+    /// The longest packet the server takes from or gives the host: twice wMaxPacketSize, for a host
+    /// that rounds its frames up.
+    public static let packetLimit = 2 * maxPacketBytes
+    /// The longest transfer the server reads: every isochronous packet USB/IP allows at `packetLimit`.
+    /// Far below the protocol's own limit, so a host can't make the server read megabytes at a time.
+    public static let maxTransferLength = USBIP.maxIsoPackets * packetLimit
 
     public static let playbackEndpoint: UInt8 = 0x01
     public static let captureEndpoint: UInt8 = 0x82

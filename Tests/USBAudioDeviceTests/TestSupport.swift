@@ -70,8 +70,9 @@ enum ClientMessages {
         return w.data
     }
 
+    /// `overlapping`: every iso packet at offset 0 (each within the buffer, their sum past it).
     static func submit(sequence: UInt32, direction: UInt32, endpoint: UInt32, setup: [UInt8] = Array(repeating: 0, count: 8),
-                       outData: Data = Data(), length: UInt32? = nil, isoLengths: [UInt32]? = nil) -> Data {
+                       outData: Data = Data(), length: UInt32? = nil, isoLengths: [UInt32]? = nil, overlapping: Bool = false) -> Data {
         var w = BigEndianWriter()
         w.u32(1); w.u32(sequence); w.u32(0x0001_0001); w.u32(direction); w.u32(endpoint)
         let total = length ?? (isoLengths.map { $0.reduce(0, +) } ?? UInt32(outData.count))
@@ -79,7 +80,7 @@ enum ClientMessages {
         for b in setup { w.u8(b) }
         w.bytes(outData)
         var offset: UInt32 = 0
-        for l in isoLengths ?? [] { w.u32(offset); w.u32(l); w.u32(0); w.u32(0); offset += l }
+        for l in isoLengths ?? [] { w.u32(overlapping ? 0 : offset); w.u32(l); w.u32(0); w.u32(0); offset += l }
         return w.data
     }
 
@@ -123,11 +124,11 @@ final class TestClient: @unchecked Sendable {
 
     @discardableResult
     func submit(direction: UInt32, endpoint: UInt32, setup: [UInt8] = Array(repeating: 0, count: 8), outData: Data = Data(),
-                length: UInt32? = nil, isoLengths: [UInt32]? = nil) throws -> UInt32 {
+                length: UInt32? = nil, isoLengths: [UInt32]? = nil, overlapping: Bool = false) throws -> UInt32 {
         sequence += 1
         directions[sequence] = direction
         try send(ClientMessages.submit(sequence: sequence, direction: direction, endpoint: endpoint, setup: setup,
-                                       outData: outData, length: length, isoLengths: isoLengths))
+                                       outData: outData, length: length, isoLengths: isoLengths, overlapping: overlapping))
         return sequence
     }
 
