@@ -118,6 +118,78 @@ import Testing
         #expect(abs(elapsed - 1000 / 1.01) < 0.5)
     }
 
+    /// What `AdaptiveLead` goes by: how late the late URBs came, and how much queued audio was left
+    /// at the worst arrival once the stream had run a second. Asking starts the count over.
+    @Test func saysHowItsURBsArrived() {
+        let clock = ManualClock()
+        let pacer = EndpointPacer(lead: 0.04, clock: clock)
+        var id: UInt32 = 0
+        func submit() { id += 1; pacer.enqueue(id: id, frameCount: 480) {} }
+        // The first second: 100 URBs, each as the one before it is due. No slack is said yet.
+        for _ in 1 ... 100 { submit(); clock.advance(milliseconds: 10) }
+        #expect(pacer.takeArrivals() == EndpointPacer.Arrivals())
+        // On time from there: each arrives as the audio queued so far ends, so nothing is left ahead.
+        submit()
+        #expect(pacer.takeArrivals() == EndpointPacer.Arrivals(late: 0, worstLateness: 0, leastSlack: 0))
+        // Two at once: the second finds the first's 10 ms ahead of it.
+        submit()
+        #expect(pacer.takeArrivals().leastSlack.map { abs($0 - 0.01) < 0.0001 } == true)
+        // 70 ms with nothing sent: the audio queued ran out 50 ms ago.
+        clock.advance(milliseconds: 70)
+        submit()
+        let arrivals = pacer.takeArrivals()
+        #expect(arrivals.late == 1 && abs(arrivals.worstLateness - 0.05) < 0.0001 && arrivals.leastSlack == nil)
+        #expect(pacer.takeArrivals() == EndpointPacer.Arrivals())
+        #expect(pacer.statistics.lateURBs == 1 && abs(pacer.statistics.worstLateness - 0.05) < 0.0001)
+    }
+
+    /// A stream that starts within the idle gap of the last one's audio isn't late by the pause
+    /// between them (it grew the lead to its most); a gap that long in the middle of a stream is the
+    /// latest a URB can be, and one of seconds is a guest that was paused.
+    @Test func aNewStreamIsNotLateAndAStallPastTheIdleGapIs() {
+        let clock = ManualClock()
+        let pacer = EndpointPacer(lead: 0.04, clock: clock)
+        var id: UInt32 = 0
+        func submit() { id += 1; pacer.enqueue(id: id, frameCount: 480) {} }
+        submit(); submit()
+        _ = pacer.takeArrivals()
+        // The stream stops, and another starts 150 ms after the queued audio's end.
+        clock.advance(milliseconds: 170)
+        pacer.newStream()
+        submit(); submit()
+        #expect(pacer.takeArrivals().late == 0)
+        #expect(pacer.statistics.lateURBs == 0 && pacer.statistics.timelineRestarts == 0)
+        // 0.5 s with nothing sent in the middle of it: a new timeline, and said as late.
+        clock.advance(milliseconds: 520)
+        submit()
+        let stalled = pacer.takeArrivals()
+        #expect(stalled.late == 1 && abs(stalled.worstLateness - 0.5) < 0.001)
+        #expect(pacer.statistics.timelineRestarts == 1)
+        // Ten seconds: the guest was paused.
+        clock.advance(milliseconds: 10_010)
+        submit()
+        #expect(pacer.takeArrivals().late == 0)
+        #expect(pacer.statistics.timelineRestarts == 2 && pacer.statistics.lateURBs == 1)
+    }
+
+    /// A lead that changes applies from the next URB queued; the ones waiting keep their times, and
+    /// all still complete in order.
+    @Test func aChangedLeadAppliesFromTheNextURB() {
+        let clock = ManualClock()
+        let pacer = EndpointPacer(lead: 0, clock: clock)
+        let start = clock.now()
+        let completions = Locked<[(UInt32, UInt64)]>([])
+        func submit(_ id: UInt32) { pacer.enqueue(id: id, frameCount: 480) { completions.mutate { $0.append((id, clock.now() - start)) } } }
+        submit(1) // due at 10 ms
+        submit(2) // due at 20 ms
+        pacer.setLead(0.015)
+        submit(3) // its audio ends at 30 ms: due at 15 ms, but after 2
+        submit(4) // due at 25 ms
+        clock.advance(milliseconds: 40)
+        #expect(completions.value.map(\.0) == [1, 2, 3, 4])
+        #expect(completions.value.map { $0.1 / 1_000_000 } == [10, 20, 20, 25])
+    }
+
     /// The long-run rate holds whatever the jitter, with the guest keeping two URBs in flight and
     /// resubmitting each 0–15 ms after a completion (a re-anchoring pacer ran 20% slow here).
     @Test func longRunRateIsExactUnderJitter() {

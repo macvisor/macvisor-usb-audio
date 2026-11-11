@@ -197,3 +197,82 @@ func waitUntil(_ condition: () -> Bool) -> Bool {
     }
     return condition()
 }
+
+@Suite struct AdaptiveLeadTests {
+    private func arrivals(late: Int = 0, by: Double = 0, slack: Double? = nil) -> EndpointPacer.Arrivals {
+        EndpointPacer.Arrivals(late: late, worstLateness: by, leastSlack: slack)
+    }
+
+    /// Late URBs grow the lead by how late they came and 20 ms, to the next 10 ms, up to the most.
+    @Test func lateURBsGrowTheLeadByHowLateTheyCame() {
+        var lead = AdaptiveLead(base: 0.04, most: 0.2)
+        #expect(lead.tick(arrivals(slack: 0.05)) == nil)
+        #expect(lead.tick(arrivals(late: 3, by: 0.034)).map { abs($0 - 0.10) < 1e-9 } == true) // 40 + 34 + 20, up to 100
+        #expect(lead.tick(arrivals(late: 1, by: 0.006)).map { abs($0 - 0.13) < 1e-9 } == true)
+        #expect(lead.tick(arrivals(late: 1, by: 0.5)) == 0.2)
+        #expect(lead.tick(arrivals(late: 9, by: 0.5)) == nil) // at the most: nothing changes
+        #expect(lead.lead == 0.2)
+    }
+
+    /// It comes down after 30 s of playing in which nothing was late: at once to where 60 ms would
+    /// have been left at the worst arrival when more than 80 ms were, by 10 ms while 40 ms were; not
+    /// while nothing plays, and not while a stream needs it.
+    @Test func itComesDownOnlyWhenTheStreamHasRoomToSpare() {
+        func near(_ a: Double?, _ b: Double) -> Bool { a.map { abs($0 - b) < 1e-9 } == true }
+        var lead = AdaptiveLead(base: 0.04, most: 0.2)
+        #expect(near(lead.tick(arrivals(late: 1, by: 0.03)), 0.09))
+        #expect(lead.grewForLateness)
+        // Nothing plays for ten minutes: it stays.
+        for _ in 1 ... 2400 { #expect(lead.tick(arrivals()) == nil) }
+        // 30 s on time with 100 ms left at each arrival: down by the 40 ms beyond 60, at the 120th tick.
+        for _ in 1 ... 119 { #expect(lead.tick(arrivals(slack: 0.1)) == nil) }
+        #expect(near(lead.tick(arrivals(slack: 0.1)), 0.05))
+        // 30 s in which one arrival found 30 ms left: it stays, and the count starts over.
+        for tick in 1 ... 120 { #expect(lead.tick(arrivals(slack: tick == 60 ? 0.03 : 0.09)) == nil) }
+        // A late URB in a calm stretch starts it over too.
+        for _ in 1 ... 100 { _ = lead.tick(arrivals(slack: 0.09)) }
+        #expect(near(lead.tick(arrivals(late: 1, by: 0.001)), 0.08)) // 50 + 1 + 20, up to 80
+        for _ in 1 ... 119 { #expect(lead.tick(arrivals(slack: 0.07)) == nil) }
+        // 70 ms left at the worst: a step.
+        #expect(near(lead.tick(arrivals(slack: 0.07)), 0.07))
+        #expect(lead.grewForLateness)
+        // Plenty left: all the way down, and no further.
+        for _ in 1 ... 120 { _ = lead.tick(arrivals(slack: 0.15)) }
+        #expect(near(lead.lead, 0.04))
+        #expect(!lead.grewForLateness)
+        for _ in 1 ... 240 { #expect(lead.tick(arrivals(slack: 0.1)) == nil) }
+    }
+
+    /// A stream starts with more than the base (a guest is busiest as it starts to play), comes down
+    /// as it shows it has room, and the next stream starts with it again.
+    @Test func aStreamStartsWithACushion() {
+        func near(_ a: Double?, _ b: Double) -> Bool { a.map { abs($0 - b) < 1e-9 } == true }
+        var lead = AdaptiveLead(base: 0.04, most: 0.2, start: 0.1)
+        #expect(lead.lead == 0.1 && !lead.grewForLateness)
+        #expect(lead.streamEnded() == nil) // nothing to change yet
+        for _ in 1 ... 119 { #expect(lead.tick(arrivals(slack: 0.108)) == nil) }
+        #expect(near(lead.tick(arrivals(slack: 0.108)), 0.06))
+        for _ in 1 ... 119 { _ = lead.tick(arrivals(slack: 0.068)) }
+        #expect(near(lead.tick(arrivals(slack: 0.068)), 0.05))
+        // The stream ends: the next starts with the cushion, and the calm count over.
+        #expect(lead.streamEnded() == 0.1)
+        for _ in 1 ... 119 { #expect(lead.tick(arrivals(slack: 0.108)) == nil) }
+        #expect(near(lead.tick(arrivals(slack: 0.108)), 0.06))
+        // One that grew past the cushion keeps what it grew to.
+        _ = lead.tick(arrivals(late: 1, by: 0.1))
+        #expect(near(lead.lead, 0.18))
+        #expect(lead.streamEnded() == nil)
+        #expect(near(lead.lead, 0.18))
+        // A cushion is never more than the most, or less than the base.
+        #expect(AdaptiveLead(base: 0.04, most: 0.08, start: 0.1).lead == 0.08)
+        #expect(AdaptiveLead(base: 0.04, most: 0.2, start: 0.01).lead == 0.04)
+    }
+
+    /// A server made with no lead, or with no room above its lead, keeps it.
+    @Test func aLeadWithNoRoomAboveItStays() {
+        var fixed = AdaptiveLead(base: 0.5, most: 0.2)
+        #expect(fixed.most == 0.5)
+        #expect(fixed.tick(arrivals(late: 5, by: 0.3)) == nil)
+        #expect(fixed.lead == 0.5)
+    }
+}

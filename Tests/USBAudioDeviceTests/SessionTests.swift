@@ -6,6 +6,8 @@ import Testing
 /// A playback sink whose `play` waits for the test: a pacer's job held between leaving the queue and
 /// sending its reply.
 final class BlockingSink: PlaybackSink, @unchecked Sendable {
+    func playbackLead(_ seconds: Double) {}
+    var startBacklog: Double { 0 }
     let entered = DispatchSemaphore(value: 0)
     let proceed = DispatchSemaphore(value: 0)
     func playbackStarted() {}

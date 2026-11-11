@@ -4,27 +4,44 @@ import USBAudioDevice
 
 /// Plays the device's playback stream on the Mac's default output device.
 ///
-/// The output engine starts when the host starts streaming and stops `idleStop` after it stops, so a
-/// short system sound right after another doesn't pay for an engine start. A CoreAudioPlayback that is
-/// freed stops its engine at once, on a queue of its own (a runner drops its USB audio after a restart
-/// with other settings, on its main thread).
+/// The output engine starts when the host starts streaming, and a stream doesn't wait for it. The
+/// Mac's audio hardware takes its time to start (0.43 s on a display's speakers for an engine that
+/// was only paused, 0.53 s for a new one), and what the guest played meanwhile used to go unheard:
+/// that much of each stream that came more than 30 s after the last, all but the last quarter second
+/// of a 0.7 s system sound and the beginning of every video (the owner's Windows VM, 11 Nov 2026).
+/// Two things now:
+/// - **The engine goes on running after a stream**, playing silence, for `wiredIdleStop` (two minutes)
+///   where the Mac's output is wired: built in, or on USB, HDMI, DisplayPort or Thunderbolt. Not
+///   longer: a running output keeps the Mac from going to sleep on its own, silent or not (the audio
+///   daemon holds off idle sleep for it), and a guest that makes a sound now and then would keep a
+///   MacBook awake. On Bluetooth or AirPlay it runs on for `idleStop` (30 s) only: a headset kept
+///   streaming silence uses its battery, and stays with the Mac. Then it pauses, keeping what it
+///   was built with, and the next stream starts it again.
+/// - **An engine that starts plays the stream from its beginning**, up to three quarters of a second
+///   of it (`StereoRing.Bounds.startKeep`): a short sound is heard whole, half a second late, and a
+///   long one starts that much behind and is played down to the lead in five seconds by the server's
+///   steering, which has the guest send a tenth slower meanwhile (`startBacklog`,
+///   `PlaybackSteering`), so nothing is skipped.
+/// A CoreAudioPlayback that is freed stops its engine at once, on a queue of its own (a runner drops
+/// its USB audio after a restart with other settings, on its main thread).
 ///
 /// **Latency.** The server completes playback URBs 40 ms (its lead) before their audio is due, so the
 /// guest keeps that much queued, and that much is what the ring holds (`StereoRing.Bounds.playback`):
-/// - an engine starts with the newest 40 ms: one takes up to half a second to start, and the stream
-///   doesn't wait for it;
-/// - a write past 100 ms drops the oldest audio down to 40 ms;
+/// - an engine that starts has more for a while, as above;
+/// - otherwise a write past 100 ms drops the oldest audio down to 40 ms;
 /// - a stall: the output plays silence, then the late URBs catch up at once, and the ring would keep
 ///   the stall as latency. A quarter of a second averaging more than 20 ms above the target drops the
 ///   excess.
 /// `bufferedSeconds` reports the level; the server steers its pacer to hold it at its lead, so the
-/// guest follows the output device's clock.
+/// guest follows the output device's clock. A server whose lead grows because the guest's audio comes
+/// late says so (`playbackLead`), and the ring holds that much, with the same room above it.
 ///
 /// A change of the Mac's output (AirPods connecting, a USB DAC, another default device) stops an
 /// AVAudioEngine and posts `AVAudioEngineConfigurationChange`: while the host streams, the engine is
 /// built again on the new device, at most once a second (a headset switching profiles posts several in
-/// a row); in the idle window after a stream it just stops. An engine that fails to start is tried
-/// again after a growing pause (`StartBackoff`), not at every URB or stream start.
+/// a row); in the idle window after a stream, or paused, it just stops, and the next stream builds
+/// one. An engine that fails to start is tried again after a growing pause (`StartBackoff`), not at
+/// every URB or stream start.
 ///
 /// **A guest starting and stopping its stream in a loop** (SET_INTERFACE as fast as it can send it)
 /// sets what it wants, and the queue acts on the last of it (`StreamRequests`): however many starts and
@@ -39,8 +56,14 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     private var logHandler: (@Sendable (String) -> Void)?
     private let ring: StereoRing
     private let idleStop: TimeInterval
+    private let wiredIdleStop: TimeInterval
     private let makeOutput: MakePlaybackOutput
-    private let queue = DispatchQueue(label: "usb-audio.coreaudio.playback")
+    /// What the ring can hold: the most a lead grows to (0.2 s) with what an output that starts is
+    /// kept (0.75 s), and room.
+    private static let ringSeconds = 1.5
+    /// A stream's start waits for nothing else here: at the default QoS the block that starts the
+    /// engine waited behind the vCPU threads of a busy Mac.
+    private let queue = DispatchQueue(label: "usb-audio.coreaudio.playback", qos: .userInitiated)
     /// Whether the host streams, as it said last; acted on by `reconcile`.
     private let requests = StreamRequests()
     /// The idle stop: one timer, set again by each stop. It used to be a work item per stop, each
@@ -48,23 +71,31 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     private let idleTimer: DispatchSourceTimer
     // On the queue:
     private var output: (any PlaybackOutput)?
+    /// The output is paused: the idle timer's doing, until the next stream.
+    private var paused = false
     /// Counts the outputs built: a change notification about an older one is stale.
     private var generation = 0
     /// Between playbackStarted and playbackStopped, as `reconcile` last acted on it.
     private var streaming = false
-    /// When the idle timer stops the output (nil: it doesn't).
+    /// When the idle timer pauses the output (nil: it doesn't).
     private var idleStopAt: DispatchTime?
     private var backoff = StartBackoff()
 
-    public convenience init(idleStop: TimeInterval = 30) {
-        self.init(idleStop: idleStop, bounds: .playback) { ring, changed in try EnginePlaybackOutput(ring: ring, changed: changed) }
+    /// - Parameters:
+    ///   - idleStop: how long the output runs on after a stream.
+    ///   - wiredIdleStop: how long it does where the Mac's output is wired.
+    public convenience init(idleStop: TimeInterval = 30, wiredIdleStop: TimeInterval = 120) {
+        self.init(idleStop: idleStop, wiredIdleStop: wiredIdleStop, bounds: .playback) { ring, changed in
+            try EnginePlaybackOutput(ring: ring, changed: changed)
+        }
     }
 
     /// `makeOutput` builds an output reading `ring`, which calls `changed` when the Mac's output
     /// device changes under it, or throws when it can't be built (tests pass a stand-in).
-    init(idleStop: TimeInterval, bounds: StereoRing.Bounds, makeOutput: @escaping MakePlaybackOutput) {
+    init(idleStop: TimeInterval, wiredIdleStop: TimeInterval? = nil, bounds: StereoRing.Bounds, makeOutput: @escaping MakePlaybackOutput) {
         self.idleStop = idleStop
-        ring = StereoRing(capacitySeconds: 0.5, bounds: bounds)
+        self.wiredIdleStop = wiredIdleStop ?? idleStop
+        ring = StereoRing(capacitySeconds: Self.ringSeconds, bounds: bounds)
         self.makeOutput = makeOutput
         idleTimer = DispatchSource.makeTimerSource(queue: queue)
         idleTimer.setEventHandler { [weak self] in self?.idleTimerFired() }
@@ -87,6 +118,30 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     /// What the ring dropped to hold the latency (tests).
     var ringStatistics: StereoRing.Statistics { ring.statistics }
 
+    /// How playback has gone since this sink was made: what a listener would have heard go wrong.
+    public struct Statistics: Equatable, Sendable {
+        /// Times the output ran out of audio in the middle of a stream, and the silence it played
+        /// for them, in seconds.
+        public var gaps = 0
+        public var gapSeconds = 0.0
+        /// Audio dropped to hold the latency (after a stall, or what piled up while the output
+        /// started), in seconds.
+        public var droppedSeconds = 0.0
+
+        public init(gaps: Int = 0, gapSeconds: Double = 0, droppedSeconds: Double = 0) {
+            self.gaps = gaps
+            self.gapSeconds = gapSeconds
+            self.droppedSeconds = droppedSeconds
+        }
+    }
+
+    public var statistics: Statistics {
+        let ring = ring.statistics
+        let rate = Double(UAC1AudioDevice.sampleRate)
+        return Statistics(gaps: ring.gaps, gapSeconds: Double(ring.gapFrames) / rate,
+                          droppedSeconds: Double(ring.excessFrames + ring.trimmedFrames) / rate)
+    }
+
     /// How the stream events and URBs queued their work (tests).
     var queueStatistics: StreamRequests.Statistics { requests.statistics }
 
@@ -102,6 +157,19 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
 
     public func playbackStopped() {
         request(streaming: false)
+    }
+
+    /// What an output that started late still holds of the stream's beginning, for the server to
+    /// play down.
+    public var startBacklog: Double {
+        Double(ring.heldExcess) / Double(UAC1AudioDevice.sampleRate)
+    }
+
+    /// The server's lead changed: the ring holds that much (the ring's capacity leaves room for its
+    /// ceiling above the most a server asks for).
+    public func playbackLead(_ seconds: Double) {
+        let most = 0.4
+        ring.setTarget(frames: Int((max(0.005, min(seconds, most)) * Double(UAC1AudioDevice.sampleRate)).rounded()))
     }
 
     /// Waits for what the queue has to do (tests).
@@ -125,13 +193,18 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
             if wanted {
                 setIdleStop(nil)
             } else {
-                setIdleStop(.now() + idleStop)
+                setIdleStop(.now() + (output?.isWired == true ? wiredIdleStop : idleStop))
+                ring.streamEnded()
             }
         }
         guard streaming else { return }
         if let output {
-            // Stopped without a notification (or before it is handled): the same as a change.
-            if !output.isRunning { outputChanged(generation: generation) }
+            if paused {
+                resumeOutput(output)
+            } else if !output.isRunning {
+                // Stopped without a notification (or before it is handled): the same as a change.
+                outputChanged(generation: generation)
+            }
         } else if backoff.mayTry(at: Date()) {
             startOutput()
         }
@@ -150,7 +223,44 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
             idleTimer.schedule(deadline: at)
             return
         }
-        stopOutput()
+        pauseOutput()
+    }
+
+    /// On the queue: the idle window is over. The output pauses, built as it is, and what the ring
+    /// holds goes; one that stopped by itself meanwhile is let go.
+    private func pauseOutput() {
+        setIdleStop(nil)
+        guard !paused else { return }
+        // None (it failed to start, or went with the Mac's output), or one that stopped by itself:
+        // what the ring kept for it goes, and the next stream starts afresh.
+        guard let output, output.isRunning else {
+            stopOutput()
+            return
+        }
+        output.pause()
+        paused = true
+        ring.clear()
+        log?("playback: output engine paused")
+    }
+
+    /// On the queue: a stream after the idle window starts the paused output again. One that doesn't
+    /// start is let go, and built again as any that failed to start.
+    private func resumeOutput(_ output: any PlaybackOutput) {
+        let began = DispatchTime.now().uptimeNanoseconds
+        ring.outputStarts()
+        do {
+            try output.start()
+            paused = false
+            log?("playback: output engine started again\(Self.took(since: began))")
+        } catch {
+            log?("playback: the paused output engine didn't start again: \(error); building one")
+            teardown()
+            startOutput()
+        }
+    }
+
+    private static func took(since began: UInt64) -> String {
+        String(format: " in %.0f ms", Double(DispatchTime.now().uptimeNanoseconds &- began) / 1e6)
     }
 
     /// On the queue.
@@ -158,6 +268,11 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         guard streaming, output == nil else { return }
         generation += 1
         let current = generation
+        let began = DispatchTime.now().uptimeNanoseconds
+        // Before the output is built, which takes a tenth of a second of the stream itself: from here
+        // on the ring keeps the stream's beginning for it (the first 70 ms of a video went at the
+        // ceiling while an engine was built, 12 Nov 2026).
+        ring.outputStarts()
         do {
             // The output observes changes from before its start: a change while it starts isn't lost. The
             // observer holds neither the output nor this object.
@@ -165,7 +280,6 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
                 guard let self else { return }
                 queue.async { self.outputChanged(generation: current) }
             }
-            ring.trimOnNextRead()
             do {
                 try output.start()
             } catch {
@@ -174,7 +288,7 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
             }
             self.output = output
             let after = backoff.succeeded(at: Date())
-            log?("playback: output engine started (\(output.formatDescription))\(after > 0 ? " after \(after) failed attempt(s)" : "")")
+            log?("playback: output engine started (\(output.formatDescription))\(Self.took(since: began))\(after > 0 ? " after \(after) failed attempt(s)" : "")")
         } catch {
             if backoff.failed(at: Date()) == 1 {
                 log?("playback: output engine failed to start: \(error); trying again, less and less often")
@@ -194,6 +308,8 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         }
         log?("playback: the Mac's output changed; starting the engine on it again")
         teardown()
+        // From here the ring keeps the stream for the next output, within its bounds for one.
+        ring.outputStarts()
         // Not before a second after the last start; failures keep their pause.
         let at = backoff.holdOffAfterStart(seconds: 1)
         queue.asyncAfter(deadline: .now() + max(0, at.timeIntervalSinceNow)) { [weak self] in
@@ -205,6 +321,7 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     private func teardown() {
         output?.stop()
         output = nil
+        paused = false
     }
 
     private func stopOutput() {
@@ -279,8 +396,15 @@ func retireEngine(_ stop: @escaping @Sendable () -> Void) {
 protocol PlaybackOutput: AnyObject, Sendable {
     var isRunning: Bool { get }
     var formatDescription: String { get }
-    /// Starts playing what the ring holds; may take half a second.
+    /// Starts playing what the ring holds; takes as long as the Mac's audio hardware does to start,
+    /// up to half a second.
     func start() throws
+    /// Stops playing, and the Mac's audio hardware with it, keeping what `start()` needs to play
+    /// again. Still observing: a change of the Mac's output is still said.
+    func pause()
+    /// Whether the Mac's output is one that costs nothing to keep started while nothing plays: built
+    /// in, or on USB, HDMI, DisplayPort or Thunderbolt; not a Bluetooth or AirPlay one.
+    var isWired: Bool { get }
     /// Stops playing and observing; safe to call more than once, from any thread.
     func stop()
 }
@@ -328,7 +452,33 @@ final class EnginePlaybackOutput: PlaybackOutput, @unchecked Sendable {
     var isRunning: Bool { engine.isRunning }
     var formatDescription: String { "\(engine.outputNode.outputFormat(forBus: 0))" }
 
+    var isWired: Bool {
+        guard let unit = engine.outputNode.audioUnit else { return false }
+        var device = AudioDeviceID(0)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        guard AudioUnitGetProperty(unit, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &device, &size) == noErr else { return false }
+        var transport: UInt32 = 0
+        size = UInt32(MemoryLayout<UInt32>.size)
+        var address = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyTransportType, mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &transport) == noErr else { return false }
+        return Self.wiredTransports.contains(transport)
+    }
+
+    /// Not Bluetooth, Bluetooth LE or AirPlay, and not what can't be told (an aggregate or a virtual
+    /// device may have a headset behind it).
+    static let wiredTransports: Set<UInt32> = [
+        kAudioDeviceTransportTypeBuiltIn, kAudioDeviceTransportTypeUSB, kAudioDeviceTransportTypeHDMI,
+        kAudioDeviceTransportTypeDisplayPort, kAudioDeviceTransportTypeThunderbolt, kAudioDeviceTransportTypeFireWire,
+        kAudioDeviceTransportTypePCI, kAudioDeviceTransportTypeAVB,
+    ]
+
     func start() throws { try engine.start() }
+
+    func pause() {
+        guard !lock.withLock({ stopped }) else { return }
+        engine.pause()
+    }
 
     func stop() {
         guard lock.withLock({ () -> Bool in defer { stopped = true }; return !stopped }) else { return }

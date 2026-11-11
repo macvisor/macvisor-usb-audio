@@ -106,6 +106,121 @@ import Testing
         #expect(outputs.all[0].stopCount >= 1)
     }
 
+    /// The idle window over, the output pauses rather than goes: the next stream starts the same one
+    /// again, which takes milliseconds where building one took up to half a second, and that much of
+    /// the stream's beginning with it (11 Nov 2026).
+    @Test func theIdleStopPausesTheOutputAndTheNextStreamStartsItAgain() throws {
+        let outputs = FakeOutputs()
+        let sink = playback(outputs, idleStop: 0.2)
+        let said = Box<[String]>([])
+        sink.log = { line in said.mutate { $0.append(line) } }
+        sink.playbackStarted()
+        sink.waitForQueue()
+        let output = try #require(outputs.all.first)
+        #expect(output.isRunning && output.startCount == 1)
+        sink.playbackStopped()
+        #expect(eventually { output.pauseCount == 1 && !output.isRunning })
+        #expect(output.stopCount == 0)
+        // Nothing more happens to it while nothing plays.
+        Thread.sleep(forTimeInterval: 0.4)
+        sink.waitForQueue()
+        #expect(output.pauseCount == 1 && output.stopCount == 0)
+        sink.playbackStarted()
+        sink.waitForQueue()
+        #expect(outputs.all.count == 1)
+        #expect(output.isRunning && output.startCount == 2 && output.stopCount == 0)
+        // And again after the next idle window.
+        sink.playbackStopped()
+        #expect(eventually { output.pauseCount == 2 && !output.isRunning })
+        sink.play(Data(count: 1920)) // audio with no start event after it: nothing starts
+        sink.waitForQueue()
+        #expect(!output.isRunning)
+        let lines = said.value
+        #expect(lines.filter { $0.contains("output engine paused") }.count == 2)
+        #expect(lines.filter { $0.contains("output engine started again") }.count == 1)
+    }
+
+    /// On a wired output the engine runs on for longer after a stream (two minutes in use), since
+    /// starting the Mac's audio hardware costs each stream its first half second; on a wireless one,
+    /// which a silent stream holds and drains, for the short time.
+    @Test func aWiredOutputRunsOnLongerAfterAStream() throws {
+        let outputs = FakeOutputs()
+        let sink = CoreAudioPlayback(idleStop: 0.2, wiredIdleStop: 1.5, bounds: .playback) { try outputs.make($0, $1) }
+        sink.playbackStarted()
+        sink.waitForQueue()
+        let output = try #require(outputs.all.first)
+        output.isWired = true
+        sink.playbackStopped()
+        sink.waitForQueue()
+        Thread.sleep(forTimeInterval: 0.7) // well past the short time
+        sink.waitForQueue()
+        #expect(output.isRunning && output.pauseCount == 0)
+        // A stream in that time finds it running: nothing to start.
+        sink.playbackStarted()
+        sink.waitForQueue()
+        #expect(output.startCount == 1)
+        sink.playbackStopped()
+        #expect(eventually(within: 3) { output.pauseCount == 1 && !output.isRunning })
+        // The Mac's output is a headset now: the short time.
+        output.isWired = false
+        sink.playbackStarted()
+        sink.waitForQueue()
+        #expect(output.isRunning && output.startCount == 2)
+        sink.playbackStopped()
+        #expect(eventually(within: 1) { output.pauseCount == 2 })
+    }
+
+    /// A paused output that doesn't start again (the Mac's output went meanwhile, without a word) is
+    /// let go and another built, in the same stream start.
+    @Test func aPausedOutputThatDoesNotStartAgainIsReplaced() throws {
+        let outputs = FakeOutputs()
+        let sink = playback(outputs, idleStop: 0.2)
+        sink.playbackStarted()
+        sink.waitForQueue()
+        let first = try #require(outputs.all.first)
+        sink.playbackStopped()
+        #expect(eventually { first.pauseCount == 1 })
+        first.failToResume()
+        sink.playbackStarted()
+        sink.waitForQueue()
+        #expect(outputs.all.count == 2)
+        #expect(first.stopCount == 1 && !first.isRunning)
+        #expect(outputs.all[1].isRunning)
+    }
+
+    /// A change of the Mac's output while the output is paused lets it go; the next stream builds one
+    /// on the new device.
+    @Test func aDeviceChangeWhilePausedLetsTheOutputGo() throws {
+        let outputs = FakeOutputs()
+        let sink = playback(outputs, idleStop: 0.2)
+        sink.playbackStarted()
+        sink.waitForQueue()
+        let first = try #require(outputs.all.first)
+        sink.playbackStopped()
+        #expect(eventually { first.pauseCount == 1 })
+        first.deviceChanged()
+        #expect(eventually { first.stopCount == 1 })
+        Thread.sleep(forTimeInterval: 1.2) // past the second a rebuild waits for: none comes
+        sink.waitForQueue()
+        #expect(outputs.all.count == 1)
+        sink.playbackStarted()
+        sink.waitForQueue()
+        #expect(outputs.all.count == 2 && outputs.all[1].isRunning)
+    }
+
+    /// A freed playback stops a paused output too.
+    @Test func aFreedPlaybackStopsItsPausedOutput() throws {
+        let outputs = FakeOutputs()
+        var sink: CoreAudioPlayback? = playback(outputs, idleStop: 0.2)
+        sink?.playbackStarted()
+        sink?.waitForQueue()
+        let output = try #require(outputs.all.first)
+        sink?.playbackStopped()
+        #expect(eventually { output.pauseCount == 1 })
+        sink = nil
+        #expect(eventually { output.stopCount == 1 })
+    }
+
     /// The server's steering holds the sink at its lead; it used to hold whatever the first two
     /// seconds of a stream showed (half a second, after a slow engine start).
     @Test func theSteeringHoldsTheLeadNotTheFirstLevel() {
@@ -117,6 +232,59 @@ import Testing
         #expect(abs(settled.adjustment(level: 0.04)) < 1)
         #expect(settled.adjustment(level: nil) == 0) // nothing plays: start over
         #expect(settled.adjustment(level: 0.45) == 0)
+    }
+
+    /// A sink whose output started late with the stream's beginning says how much it holds for that:
+    /// while it does, the pacer runs a tenth slow, never by more in a quarter second than is there
+    /// to play, the drift correction resting meanwhile.
+    @Test func theSteeringPlaysALateStartsBacklogDown() {
+        var steering = PlaybackSteering(setPoint: 0.1)
+        #expect(steering.adjustment(level: 0.6, backlog: 0.5) == -100_000) // 25 ms a quarter second
+        #expect(steering.adjustment(level: 0.16, backlog: 0.06) == -100_000)
+        #expect(abs(steering.adjustment(level: 0.123, backlog: 0.023) - -40_000) < 1) // half of the 20 ms above the floor
+        // The floor and below is left to the drift correction, after two seconds of following.
+        for _ in 1 ... 8 { #expect(steering.adjustment(level: 0.1, backlog: 0.003) == 0) }
+        #expect(abs(steering.adjustment(level: 0.1, backlog: 0)) < 1)
+        // What the sink holds while nothing plays is its to play out.
+        #expect(steering.adjustment(level: nil, backlog: 0.5) == 0)
+    }
+
+    /// An output that started twice (the Mac's output changed just after a stream began) said its
+    /// backlog twice, and a count of it ran the pacer slow for twice as long: the lead drained. The
+    /// sink says what it holds now, so what it said before doesn't add up.
+    @Test func aBacklogIsWhatTheSinkHoldsNow() throws {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        ring.outputStarts()
+        ring.write(int16: tagged(first: 0, frames: 24000))
+        #expect(ring.heldExcess == 0) // nothing reads yet: nothing to play down
+        var left = [Float](repeating: 0, count: 480), right = left
+        #expect(ring.read(frames: 480, left: &left, right: &right) == 480)
+        #expect(ring.heldExcess == 24000 - 1920)
+        // The output starts again with as much: the same audio, said once.
+        ring.outputStarts()
+        #expect(ring.read(frames: 480, left: &left, right: &right) == 480)
+        #expect(ring.heldExcess == 24000 - 480 - 1920)
+        // Played down to the usual bounds: none.
+        for _ in 0 ..< 100 { _ = ring.read(frames: 480, left: &left, right: &right) } // a second: four windows
+        #expect(ring.heldExcess == 0)
+        ring.clear()
+        #expect(ring.heldExcess == 0)
+    }
+
+    /// A stream that ends with no output (it failed to start, or went with the Mac's output) leaves
+    /// nothing in the ring for the next one: its tail played before the next stream, however old.
+    @Test func aStreamThatEndsWithNoOutputLeavesNothingBehind() {
+        let outputs = FakeOutputs()
+        outputs.fail = true
+        let sink = playback(outputs, idleStop: 0.2)
+        sink.playbackStarted()
+        sink.waitForQueue() // the start is tried, and fails
+        for _ in 0 ..< 30 { sink.play(Data(count: 1920)) } // 0.3 s, kept for an output that never comes
+        sink.waitForQueue()
+        #expect((sink.bufferedSeconds ?? 0) > 0.25)
+        sink.playbackStopped()
+        #expect(eventually { (sink.bufferedSeconds ?? 1) == 0 })
+        #expect(sink.startBacklog == 0)
     }
 }
 
@@ -212,15 +380,63 @@ import Testing
 }
 
 @Suite struct RingTests {
-    /// The first read after an output starts has the newest 40 ms: the audio due now.
-    @Test func anOutputStartsWithTheNewestTarget() {
-        let ring = StereoRing(capacitySeconds: 0.5, bounds: .playback)
-        ring.write(int16: tagged(first: 0, frames: 4320)) // 90 ms, below the ceiling
-        ring.trimOnNextRead()
+    /// Silence in the middle of a stream is a gap when audio follows it soon; seconds of it is a
+    /// stream left open with nothing to play.
+    @Test func secondsOfSilenceInAnOpenStreamAreNoGap() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        var left = [Float](repeating: 0, count: 480), right = left
+        ring.write(int16: tagged(first: 0, frames: 480))
+        _ = ring.read(frames: 480, left: &left, right: &right)
+        for _ in 0 ..< 5 { _ = ring.read(frames: 480, left: &left, right: &right) } // 50 ms of nothing
+        ring.write(int16: tagged(first: 480, frames: 480))
+        #expect(ring.statistics.gaps == 1 && ring.statistics.gapFrames == 2400)
+        _ = ring.read(frames: 480, left: &left, right: &right)
+        for _ in 0 ..< 300 { _ = ring.read(frames: 480, left: &left, right: &right) } // three seconds
+        ring.write(int16: tagged(first: 960, frames: 480))
+        #expect(ring.statistics.gaps == 1 && ring.statistics.gapFrames == 2400)
+    }
+
+    /// An output that starts has the stream from its beginning: what was played while it started
+    /// isn't dropped for the newest 40 ms (it was), and isn't held to the ceiling while it is played
+    /// down.
+    @Test func anOutputStartsWithTheStreamsBeginning() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        ring.outputStarts()
+        ring.write(int16: tagged(first: 0, frames: 24000)) // half a second while it starts
         var left = [Float](repeating: 0, count: 1), right = left
         #expect(ring.read(frames: 1, left: &left, right: &right) == 1)
-        #expect(Int((left[0] * 32768).rounded()) == 4320 - 1920)
-        #expect(ring.bufferedFrames == 1920 - 1)
+        #expect(Int((left[0] * 32768).rounded()) == 0)
+        #expect(ring.bufferedFrames == 24000 - 1)
+        ring.write(int16: tagged(first: 24000, frames: 480))
+        #expect(ring.bufferedFrames == 24480 - 1) // above the ceiling, and kept
+        let stats = ring.statistics
+        #expect(stats.heldStarts == 1 && stats.startTrims == 0 && stats.ceilingTrims == 0 && stats.trimmedFrames == 0)
+    }
+
+    /// One that takes longer than that has the newest three quarters of a second above the target:
+    /// the oldest goes while it starts.
+    @Test func anOutputThatStartsLateHasTheNewestOfWhatWasKept() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        ring.outputStarts()
+        for urb in 0 ..< 120 { ring.write(int16: tagged(first: urb * 480, frames: 480)) } // 1.2 s
+        #expect(ring.bufferedFrames <= 1920 + 36000 + 960)
+        var left = [Float](repeating: 0, count: 1), right = left
+        #expect(ring.read(frames: 1, left: &left, right: &right) == 1)
+        let first = Int((left[0] * 32768).rounded()) | Int((right[0] * 32768).rounded()) << 15
+        #expect(first == 57600 - (1920 + 36000))
+        #expect(ring.statistics.trimmedFrames == 57600 - (1920 + 36000))
+    }
+
+    /// An output that starts with no more than the target and a little has nothing to play down.
+    @Test func anOutputThatStartsAtOnceIsHeldToTheUsualBounds() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        ring.outputStarts()
+        ring.write(int16: tagged(first: 0, frames: 1920))
+        var left = [Float](repeating: 0, count: 1), right = left
+        #expect(ring.read(frames: 1, left: &left, right: &right) == 1)
+        #expect(ring.statistics.heldStarts == 0)
+        for urb in 0 ..< 50 { ring.write(int16: tagged(first: 1920 + urb * 480, frames: 480)) }
+        #expect(ring.bufferedFrames <= 4800) // the ceiling holds
     }
 
     /// Nothing reads while an output starts: the ring stays between the target and the ceiling.

@@ -8,6 +8,15 @@ public protocol PlaybackSink: AnyObject, Sendable {
     func playbackStopped()
     /// Audio queued but not yet played, if the sink knows (drives the pacer's clock correction).
     var bufferedSeconds: Double? { get }
+    /// The server's lead changed (`AdaptiveLead`): that much audio is what the guest keeps queued
+    /// from now on, so that much is what a sink that holds a level should hold. A sink that holds
+    /// none does nothing; one that wraps another passes it on. (No default, like `startBacklog`: a
+    /// wrapper that didn't pass them on left its sink at the wrong level, unnoticed.)
+    func playbackLead(_ seconds: Double)
+    /// What the sink holds above its level now because its output started after the stream did and
+    /// has the stream's beginning to play, in seconds; zero when it holds none, or is no such sink.
+    /// The server has the guest send a little slower while there is some (`PlaybackSteering`).
+    var startBacklog: Double { get }
 }
 
 /// Where the device's microphone audio comes from (48 kHz stereo 16-bit little-endian PCM).
@@ -25,6 +34,8 @@ extension PlaybackSink {
 
 /// Discards playback.
 public final class NullSink: PlaybackSink, @unchecked Sendable {
+    public func playbackLead(_ seconds: Double) {}
+    public var startBacklog: Double { 0 }
     public init() {}
     public func playbackStarted() {}
     public func play(_ pcm: Data) {}
@@ -76,6 +87,8 @@ public final class ToneSource: CaptureSource, @unchecked Sendable {
 
 /// Collects playback in memory (tests), optionally bounded.
 public final class RecordingSink: PlaybackSink, @unchecked Sendable {
+    public func playbackLead(_ seconds: Double) {}
+    public var startBacklog: Double { 0 }
     private let lock = NSLock()
     private var buffer = Data()
     private var chunks = 0
@@ -109,6 +122,8 @@ public final class RecordingSink: PlaybackSink, @unchecked Sendable {
 /// Plays the guest's own playback back into its microphone, a bounded `capacity` behind: for
 /// measuring the round-trip latency inside the guest.
 public final class LoopbackPort: PlaybackSink, CaptureSource, @unchecked Sendable {
+    public func playbackLead(_ seconds: Double) {}
+    public var startBacklog: Double { 0 }
     private let lock = NSLock()
     private var buffer = Data()
     private let capacity: Int
@@ -142,6 +157,8 @@ public final class LoopbackPort: PlaybackSink, CaptureSource, @unchecked Sendabl
 
 /// Writes playback to a 48 kHz stereo 16-bit WAV file; the header is completed by `close()`.
 public final class WAVFileSink: PlaybackSink, @unchecked Sendable {
+    public func playbackLead(_ seconds: Double) {}
+    public var startBacklog: Double { 0 }
     private let lock = NSLock()
     private let handle: FileHandle
     private var bytes: UInt32 = 0

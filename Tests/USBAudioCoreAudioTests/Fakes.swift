@@ -68,6 +68,10 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
     private let lock = NSLock()
     private var running = false
     private var stops = 0
+    private var starts = 0
+    private var pauses = 0
+    private var resumeFails = false
+    private var wired = false
 
     init(ring: StereoRing, changed: @escaping @Sendable () -> Void, gate: DispatchSemaphore?, changeWhileStarting: Bool,
          fails: Bool = false, stopGate: DispatchSemaphore? = nil) {
@@ -83,13 +87,37 @@ final class FakeOutput: PlaybackOutput, @unchecked Sendable {
 
     var isRunning: Bool { lock.withLock { running } }
     var stopCount: Int { lock.withLock { stops } }
+    var startCount: Int { lock.withLock { starts } }
+    var pauseCount: Int { lock.withLock { pauses } }
     var formatDescription: String { "stand-in" }
+
+    /// Whether the Mac's output is a wired one (the stand-in isn't, unless told).
+    var isWired: Bool {
+        get { lock.withLock { wired } }
+        set { lock.withLock { wired = newValue } }
+    }
+
+    /// The next start after a pause fails (the Mac's output went while it was paused, say).
+    func failToResume() {
+        lock.withLock { resumeFails = true }
+    }
 
     func start() throws {
         gate?.wait()
         if fails { throw Failure() }
-        lock.withLock { running = true }
+        if lock.withLock({ pauses > 0 && resumeFails }) { throw Failure() }
+        lock.withLock {
+            running = true
+            starts += 1
+        }
         if changeWhileStarting { deviceChanged() }
+    }
+
+    func pause() {
+        lock.withLock {
+            running = false
+            pauses += 1
+        }
     }
 
     /// Waits for `stopGate` first, when set (an engine's stop takes 25-40 ms, more on Bluetooth); not
@@ -132,6 +160,8 @@ final class FakeOutputs: @unchecked Sendable {
     private var failingToBuild = false
     /// Each start waits for this, when set.
     var gate: DispatchSemaphore?
+    /// Each build waits for this, when set (building an engine takes a tenth of a second).
+    var buildGate: DispatchSemaphore?
     var changeWhileStarting = false
     /// Each stop waits for this, when set.
     var stopGate: DispatchSemaphore?
@@ -154,6 +184,7 @@ final class FakeOutputs: @unchecked Sendable {
             return (failing, failingToBuild)
         }
         if failsToBuild { throw FakeOutput.Failure() }
+        buildGate?.wait()
         let output = FakeOutput(ring: ring, changed: changed, gate: gate, changeWhileStarting: changeWhileStarting,
                                 fails: fails, stopGate: stopGate)
         lock.withLock { built.append(output) }

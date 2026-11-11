@@ -38,6 +38,9 @@ public final class USBAudioServer: @unchecked Sendable {
     }
 
     private let lead: TimeInterval
+    private let mostLead: TimeInterval
+    /// What a stream starts with (`AdaptiveLead.start`): the lead itself where it doesn't change.
+    private let startLead: TimeInterval
     private let clock: PacerClock
     private let lock = NSLock()
     private var session: Session?
@@ -48,23 +51,34 @@ public final class USBAudioServer: @unchecked Sendable {
 
     /// - Parameters:
     ///   - lead: how far ahead of real time playback URBs complete (absorbs transport jitter).
+    ///   - mostLead: how far the lead may grow while the guest's audio comes late (`AdaptiveLead`);
+    ///     one no more than `lead`, or a `lead` of zero, keeps the lead as it is.
     public init(device: UAC1AudioDevice = UAC1AudioDevice(), playback: PlaybackSink, capture: CaptureSource,
-                busID: String = "1-1", lead: TimeInterval = 0.04, clock: PacerClock = DispatchClock()) {
+                busID: String = "1-1", lead: TimeInterval = 0.04, mostLead: TimeInterval = 0.2,
+                clock: PacerClock = DispatchClock()) {
         self.device = device
         self.playback = playback
         self.capture = capture
         self.busID = busID
         self.lead = lead
+        self.mostLead = lead > 0 ? max(lead, mostLead) : 0
+        startLead = lead > 0 ? min(max(lead, mostLead), max(lead, Self.streamStartLead)) : lead
         self.clock = clock
-        device.onStreamEvent = { [playback, capture] event in
+        device.onStreamEvent = { [weak self, playback, capture] event in
             switch event {
-            case .playbackStarted: playback.playbackStarted()
+            case .playbackStarted:
+                // A stream's first URB is no late one of the stream before it.
+                self?.lock.withLock { self?.session }?.playbackPacer.newStream()
+                playback.playbackStarted()
             case .playbackStopped: playback.playbackStopped()
             case .captureStarted: capture.captureStarted()
             case .captureStopped: capture.captureStopped()
             }
         }
     }
+
+    /// What a stream starts with where the lead fits itself to the guest (`AdaptiveLead`).
+    static let streamStartLead: TimeInterval = 0.1
 
     /// Whether a client has the device imported.
     public var isAttached: Bool {
@@ -193,8 +207,11 @@ public final class USBAudioServer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard session == nil else { return nil }
-        let s = Session(stream: stream, lead: lead, clock: clock)
+        let s = Session(stream: stream, lead: startLead, clock: clock)
         session = s
+        // A session starts as a stream does, whatever the last one grew to. (A server made with no
+        // lead holds none, and says nothing.)
+        if lead > 0 { playback.playbackLead(startLead) }
         startSteering(s)
         return s
     }
@@ -211,19 +228,56 @@ public final class USBAudioServer: @unchecked Sendable {
             if session === s { session = nil }
         }
         let p = s.playbackPacer.statistics, c = s.capturePacer.statistics
-        log?("device \(busID) detached (playback: \(p.completedURBs) URBs, \(p.lateURBs) late, \(p.timelineRestarts) restarts; capture: \(c.completedURBs) URBs, \(c.lateURBs) late)")
+        let worst = p.lateURBs > 0 ? String(format: " (by %.0f ms at most)", p.worstLateness * 1000) : ""
+        let spare = p.leastSlack.map { String(format: ", %.0f ms ahead at the least", $0 * 1000) } ?? ""
+        log?("device \(busID) detached (playback: \(p.completedURBs) URBs, \(p.lateURBs) late\(worst), \(p.timelineRestarts) restarts\(spare); capture: \(c.completedURBs) URBs, \(c.lateURBs) late)")
     }
 
-    /// Locks the playback timeline to the sink's clock, holding the sink's buffer at the lead
-    /// (`PlaybackSteering`), every quarter of a second.
+    /// Every quarter of a second: fits the lead to how the guest's URBs arrive (`AdaptiveLead`), and
+    /// locks the playback timeline to the sink's clock, holding the sink's buffer at the lead
+    /// (`PlaybackSteering`), where the sink says what it holds.
     private func startSteering(_ s: Session) {
-        guard playback.bufferedSeconds != nil else { return }
+        let steers = playback.bufferedSeconds != nil
+        let adapts = mostLead > lead
+        guard steers || adapts else { return }
         let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "usb-audio.steering", qos: .utility))
-        var steering = PlaybackSteering(setPoint: lead)
+        var steering = PlaybackSteering(setPoint: startLead)
+        var adaptive = AdaptiveLead(base: lead, most: mostLead, start: startLead)
+        var wasActive = false
         timer.schedule(deadline: .now() + 0.25, repeating: 0.25)
-        timer.setEventHandler { [device, playback] in
+        timer.setEventHandler { [weak self, device, playback] in
+            if adapts {
+                // The sink first: it holds the new level before the guest's audio comes that much
+                // sooner (or later).
+                func apply(_ lead: TimeInterval) {
+                    playback.playbackLead(lead)
+                    s.playbackPacer.setLead(lead)
+                    steering.setPoint = lead
+                }
+                // A stream that has stopped says nothing about the next one: its last URBs come as
+                // the guest winds it down (the last one of a 43 s stream came 7 ms late).
+                let arrivals = s.playbackPacer.takeArrivals()
+                let active = device.isPlaybackActive
+                defer { wasActive = active }
+                if !active {
+                    if wasActive, let lead = adaptive.streamEnded() { apply(lead) }
+                } else {
+                    let before = adaptive.lead
+                    let grown = adaptive.grewForLateness
+                    if let lead = adaptive.tick(arrivals) {
+                        apply(lead)
+                        if lead > before {
+                            self?.log?(String(format: "playback: the guest's audio came %.0f ms late; keeping %.0f ms of it ahead now (it was %.0f ms)",
+                                              arrivals.worstLateness * 1000, lead * 1000, before * 1000))
+                        } else if grown, !adaptive.grewForLateness {
+                            self?.log?(String(format: "playback: the guest's audio has come on time for a while; keeping %.0f ms of it ahead again", lead * 1000))
+                        }
+                    }
+                }
+            }
+            guard steers else { return }
             let level = device.isPlaybackActive ? playback.bufferedSeconds : nil
-            s.playbackPacer.setRateAdjustment(ppm: steering.adjustment(level: level))
+            s.playbackPacer.setRateAdjustment(ppm: steering.adjustment(level: level, backlog: playback.startBacklog))
         }
         s.steering = timer
         timer.resume()
@@ -379,12 +433,26 @@ public final class USBAudioServer: @unchecked Sendable {
 /// Locks the playback timeline to the sink's clock: when the sink's buffer grows the pacer slows, when
 /// it drains the pacer speeds up (a few hundred ppm at most; clock drift is tens of ppm).
 ///
-/// The set point is fixed: the server's lead, which is what the guest keeps queued and what a sink
-/// holds (`CoreAudioPlayback` does). One learned from the first two seconds of a stream learned the
-/// half second an output engine took to start, and held it (5 Nov 2026). The first two seconds still
-/// only follow the level, without steering: an output engine starts in them.
+/// A sink whose output started late with the stream's beginning kept for it says how much more than
+/// the set point it holds for that (`PlaybackSink.startBacklog`, `CoreAudioPlayback`): while it holds
+/// more than `backlogFloor` the pacer runs up to a tenth slow, half a second in five, so the guest
+/// sends that much less than the output plays and nothing is skipped. The guest's audio clock is the
+/// pacer, so what it plays keeps time with it. The drift correction rests meanwhile, and starts over
+/// after. It goes by what the sink holds at each look, not by a count kept here: a count ran on
+/// when the sink's audio went another way (an output started twice, a guest that stalled), and the
+/// lead drained after it.
+///
+/// The set point is the server's lead, which is what the guest keeps queued and what a sink holds
+/// (`CoreAudioPlayback` does); it changes only as the lead does (`AdaptiveLead`). One learned from the
+/// first two seconds of a stream learned the half second an output engine took to start, and held it
+/// (5 Nov 2026). The first two seconds still only follow the level, without steering: an output
+/// engine starts in them.
 struct PlaybackSteering {
-    let setPoint: Double
+    var setPoint: Double
+    /// How slow the pacer runs while a backlog is played down: a tenth.
+    static let backlogSlowing = 0.1
+    /// A backlog below this is left to the drift correction.
+    static let backlogFloor = 0.003
     private var average: Double?
     private var samples = 0
 
@@ -392,13 +460,23 @@ struct PlaybackSteering {
         self.setPoint = setPoint
     }
 
-    /// The pacer's rate adjustment, in ppm, for the sink's level sampled every quarter of a second;
-    /// nil while nothing plays, which starts over.
-    mutating func adjustment(level: Double?) -> Double {
+    /// The pacer's rate adjustment, in ppm, for the sink's level sampled every `interval` (a quarter
+    /// of a second); nil while nothing plays, which starts over (what the sink still holds plays
+    /// out, and there is no one to slow). `backlog`: what the sink holds above the set point now for
+    /// an output that started late.
+    mutating func adjustment(level: Double?, backlog: Double = 0, interval: Double = 0.25) -> Double {
         guard let level else {
             average = nil
             samples = 0
             return 0
+        }
+        if backlog > Self.backlogFloor {
+            // Half of what is there at the most: what the sink says is an interval old, and part of
+            // it has been played since, so the whole of it would run past the set point.
+            let played = min((backlog - Self.backlogFloor) / 2, Self.backlogSlowing * interval)
+            average = nil
+            samples = 0
+            return -played / interval * 1_000_000
         }
         samples += 1
         guard samples > 8, let previous = average else {
@@ -409,5 +487,101 @@ struct PlaybackSteering {
         average = a
         let error = a - setPoint // seconds; positive: too much buffered
         return max(-500, min(500, -error * 20_000))
+    }
+}
+
+/// Fits the playback lead to how the guest's audio arrives (11 Nov 2026).
+///
+/// The lead is the audio the guest keeps queued on the Mac: 40 ms of it absorbs a guest that submits
+/// its URBs up to 50 ms late (the lead and the URB in flight). A guest that is busier than that, or
+/// one whose vCPUs wait for a busy Mac's cores, submits later: the output runs dry, and the listener
+/// hears a gap, then a skip as the late audio is caught up with. Measured in a Windows 11 guest:
+/// - a minute of a video in a browser while the Mac ran other VMs: 124 of 6,581 URBs late;
+/// - the sound Windows plays as it signs in, the guest still starting: URBs up to 193 ms late;
+/// - a video in a browser while the Mac built an app: the worst arrival 63 ms behind the steady
+///   ones, so 40 ms would not have held, where a quiet Mac had none late in 4,165.
+///
+/// So:
+/// - **A stream starts with `start`** (100 ms): a guest is busiest as it starts to play (the browser
+///   starting a video), and what a stream's start needs can't be learned from it in time.
+/// - **Late URBs grow the lead** by how late they came and `margin`, in steps of 10 ms up to `most`,
+///   which trades that much more delay for sound without gaps.
+/// - **It comes down** after `calm` (30 s of playing) with no URB late: at once to where `keep` of
+///   queued audio would have been left at the worst arrival, when more than `roomy` was; else by
+///   10 ms while `spare` was. So a stream that needs its lead keeps it: one that stalls 80 ms every
+///   so often settles where 30 to 40 ms are left at each stall, and a calm one is at the base after
+///   a minute or two.
+/// - While nothing plays it stays as it is, but for the start of the next stream.
+///
+/// A change either way is seamless: the pacer completes the next URBs that much sooner or later, the
+/// guest follows, and no audio is dropped or made up.
+struct AdaptiveLead {
+    let base: TimeInterval
+    let most: TimeInterval
+    /// What a stream starts with, at the least.
+    let start: TimeInterval
+    private(set) var lead: TimeInterval
+    /// Whether late URBs grew the lead since it was last at the base (for the log).
+    private(set) var grewForLateness = false
+    /// Quarter seconds since the lead last changed or a URB came late, with URBs arriving.
+    private var calmTicks = 0
+    /// The least queued audio left at an arrival in those.
+    private var leastSlack: TimeInterval?
+
+    static let step: TimeInterval = 0.01
+    /// What a late URB adds beyond how late it came.
+    static let margin: TimeInterval = 0.02
+    /// The queued audio that has to have been left, at the worst, for the lead to come down a step.
+    static let spare: TimeInterval = 0.04
+    /// More than this left at the worst, and the lead comes down at once to where `keep` would be.
+    static let roomy: TimeInterval = 0.08
+    static let keep: TimeInterval = 0.06
+    /// How long that has to have held, in ticks (30 s).
+    static let calm = 120
+
+    /// - Parameter start: what a stream starts with; nil: the base.
+    init(base: TimeInterval, most: TimeInterval, start: TimeInterval? = nil) {
+        self.base = base
+        self.most = max(base, most)
+        self.start = min(self.most, max(base, start ?? base))
+        lead = self.start
+    }
+
+    /// A stream ended: the next one starts with `start` at the least. Returns the new lead when it
+    /// changes.
+    mutating func streamEnded() -> TimeInterval? {
+        calmTicks = 0
+        leastSlack = nil
+        guard lead < start - Self.step / 2 else { return nil }
+        lead = start
+        return lead
+    }
+
+    /// A quarter second's arrivals; returns the new lead when it changes.
+    mutating func tick(_ arrivals: EndpointPacer.Arrivals) -> TimeInterval? {
+        if arrivals.late > 0 {
+            calmTicks = 0
+            leastSlack = nil
+            let wanted = lead + arrivals.worstLateness + Self.margin
+            let stepped = (wanted / Self.step - 0.001).rounded(.up) * Self.step
+            let next = min(most, max(lead, stepped))
+            guard next > lead + Self.step / 2 else { return nil }
+            lead = next
+            grewForLateness = true
+            return lead
+        }
+        // Nothing arrived: nothing plays, and nothing is learned.
+        guard let slack = arrivals.leastSlack else { return nil }
+        leastSlack = min(leastSlack ?? slack, slack)
+        calmTicks += 1
+        guard calmTicks >= Self.calm else { return nil }
+        let spare = leastSlack ?? 0
+        calmTicks = 0
+        leastSlack = nil
+        guard lead > base + Self.step / 2, spare >= Self.spare else { return nil }
+        let down = spare > Self.roomy ? ((spare - Self.keep) / Self.step + 0.001).rounded(.down) * Self.step : Self.step
+        lead = max(base, ((lead - max(Self.step, down)) / Self.step).rounded() * Self.step)
+        if lead <= base + Self.step / 2 { grewForLateness = false }
+        return lead
     }
 }

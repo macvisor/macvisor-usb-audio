@@ -25,11 +25,21 @@ final class StereoRing: @unchecked Sendable {
         /// The frames read per window: many output cycles (512 frames each) and URBs (480 each), so
         /// the average doesn't depend on where in their cycles a read falls.
         var window: Int
+        /// An output that starts plays the stream from where it began, not from where it is by then:
+        /// what the ring keeps for it above `target` while it starts (the Mac's audio hardware takes
+        /// about half a second), older audio going first. Zero: the newest `target` only.
+        var startKeep = 0
+        /// How long the ring may hold more than `target + excess` after such a start, while the
+        /// server's steering plays it down (`PlaybackSteering`), before what's above counts as too
+        /// much after all.
+        var startHold = 0
 
         /// The server's 40 ms lead, never more than 100 ms; a stall leaves at most 5 ms behind it
-        /// after a window or two (a quarter of a second each).
+        /// after a window or two (a quarter of a second each). An output that starts has up to
+        /// three quarters of a second of the stream's beginning, and half a minute to play it down.
         static let playback = Bounds(target: frames(ms: 40), ceiling: frames(ms: 100), excess: frames(ms: 20),
-                                     stallExcess: frames(ms: 5), window: frames(ms: 250))
+                                     stallExcess: frames(ms: 5), window: frames(ms: 250),
+                                     startKeep: frames(ms: 750), startHold: frames(ms: 30000))
 
         static func frames(ms: Int) -> Int { 48 * ms }
     }
@@ -39,9 +49,19 @@ final class StereoRing: @unchecked Sendable {
         /// Drops of `Bounds.excess` and `Bounds.stallExcess`, and the frames they took.
         var excessTrims = 0
         var excessFrames = 0
-        /// Drops at `Bounds.ceiling`, and at an output's start.
+        /// Drops at `Bounds.ceiling`, and at an output's start (what was older than it keeps).
         var ceilingTrims = 0
         var startTrims = 0
+        /// Outputs that started with more than the target and `excess`, for the steering to play down.
+        var heldStarts = 0
+        /// The frames the drops at `Bounds.ceiling` and at an output's start took.
+        var trimmedFrames = 0
+        /// Gaps: times the output ran out of audio in the middle of a stream (it played silence, and
+        /// more audio came after it), and the silence they came to, in frames. Silence before a
+        /// stream's first audio and after its last isn't one (`streamEnded()`), nor is silence of
+        /// two seconds or more.
+        var gaps = 0
+        var gapFrames = 0
     }
 
     /// A lock with a stable address: an `os_unfair_lock` stored in the object and passed with `&`
@@ -52,14 +72,38 @@ final class StereoRing: @unchecked Sendable {
     private var count = 0 // samples (two per frame)
     /// The longest single write since `clear()`, in frames: an input tap's buffer.
     private var largestWrite = 0
-    private let bounds: Bounds?
+    private var bounds: Bounds?
     private var trimPending = false
     /// The current window: the sum of each read's level before plus after it, weighted by its frames;
     /// and the frames read.
     private var windowSum = 0
     private var windowFrames = 0
-    /// Silence the output played since the level was last at or below the target, or a drop.
+    /// Silence the output played in the middle of a stream since the level was last at or below the
+    /// target with audio to play, or a drop; and how much of it in the current window.
     private var silence = 0
+    private var windowSilence = 0
+    /// Whether the stream has had audio (since `streamEnded()`), and the silence the output has played
+    /// since its last audio: a gap, once more audio comes.
+    private var fed = false
+    private var silenceSinceAudio = 0
+    /// After the target came down: the frames still to be read before the ring is held to it, and
+    /// the ceiling it has from then on.
+    private var settling = 0
+    private var settledCeiling: Int?
+    /// After an output started with the stream's beginning: the frames read since, while the ring
+    /// may hold more than its target (`Bounds.startHold`); nil otherwise.
+    private var heldFrames: Int?
+    /// What the held ring had above its target at the output's first read, or in its last window.
+    private var heldAbove = 0
+    /// Windows read without silence since the last one that had some (`silenceExpiry`).
+    private var quietWindows = 0
+    /// A stall's late audio comes within a window or two of its end: silence older than this many
+    /// windows without more is owed nothing (a stall past the pacer's idle gap is never caught up
+    /// with, and its silence stayed to be taken out of the level's own ripple later).
+    private static let silenceExpiry = 4
+    /// Silence in a stream this long or longer isn't the output running out of audio that was on
+    /// its way: the guest had none to send (two seconds, the pacer's measure of a pause too).
+    private static let longestGap = 96000
     private var stats = Statistics()
 
     init(capacitySeconds: Double, sampleRate: Double = 48000, bounds: Bounds? = nil) {
@@ -84,12 +128,63 @@ final class StereoRing: @unchecked Sendable {
             windowSum = 0
             windowFrames = 0
             silence = 0
+            fed = false
+            silenceSinceAudio = 0
+            heldFrames = nil
+            settling = 0
+            settledCeiling = nil
+            windowSilence = 0
+            quietWindows = 0
         }
     }
 
-    /// The next read first drops all but the newest `Bounds.target` frames: an output starts with the
-    /// audio that is due now, not with what piled up while it started.
-    func trimOnNextRead() {
+    /// What the ring holds above its target for an output that started late with the stream's
+    /// beginning, in frames: what it had at the output's first read, then each measuring window's
+    /// average (the level itself ripples by a URB, and a look at it falls anywhere in one). Zero once
+    /// that is played down, or when no output started so.
+    var heldExcess: Int {
+        lock.withLockUnchecked { heldFrames != nil ? heldAbove : 0 }
+    }
+
+    /// The level a playback ring holds changes (the server's lead did): the ceiling keeps its
+    /// distance above it. Nothing is dropped for it: the level follows as the guest's audio does, so
+    /// while a lower target is new the ring still holds the old level, and it is given the time that
+    /// takes to play, and a window more, before anything above the new one counts as too much.
+    func setTarget(frames: Int) {
+        lock.withLockUnchecked {
+            guard var changed = bounds, frames > 0, frames != changed.target else { return }
+            let gap = (settledCeiling ?? changed.ceiling) - changed.target
+            if frames < changed.target {
+                settling = (changed.target - frames) + changed.window
+                settledCeiling = frames + gap
+            } else {
+                settling = 0
+                settledCeiling = nil
+                changed.ceiling = frames + gap
+            }
+            changed.target = frames
+            bounds = changed
+            // The window so far was measured against the old target.
+            windowSum = 0
+            windowFrames = 0
+        }
+    }
+
+    /// The stream ended: the silence the output plays from here on is no gap.
+    func streamEnded() {
+        lock.withLockUnchecked {
+            fed = false
+            silenceSinceAudio = 0
+            silence = 0
+            windowSilence = 0
+        }
+    }
+
+    /// An output is starting. Until its first read the ring keeps the stream from its beginning, up to
+    /// `Bounds.startKeep` above the target, so the output starts with what the guest played while it
+    /// started rather than without it; the server's steering then plays the extra down
+    /// (`PlaybackSteering`), and the ring holds it meanwhile (`Bounds.startHold`).
+    func outputStarts() {
         lock.withLockUnchecked { trimPending = true }
     }
 
@@ -105,9 +200,33 @@ final class StereoRing: @unchecked Sendable {
                     count += 1
                 }
                 largestWrite = max(largestWrite, src.count / 2)
-                if let bounds, count / 2 > bounds.ceiling {
-                    drop(frames: count / 2 - bounds.target)
-                    stats.ceilingTrims += 1
+                if bounds != nil, !src.isEmpty {
+                    // Seconds of it is a stream the guest left open with nothing to play (8.6 s
+                    // before a video's sound, in a stream something else had opened), not a gap.
+                    if fed, silenceSinceAudio > 0, silenceSinceAudio < Self.longestGap {
+                        stats.gaps += 1
+                        stats.gapFrames += silenceSinceAudio
+                    }
+                    fed = true
+                    silenceSinceAudio = 0
+                }
+                if let bounds {
+                    if trimPending {
+                        // An output is starting: the stream's beginning is kept for it, the oldest
+                        // of more than that going first.
+                        let most = bounds.target + bounds.startKeep
+                        if count / 2 > most + bounds.excess {
+                            let over = count / 2 - most
+                            drop(frames: over)
+                            stats.startTrims += 1
+                            stats.trimmedFrames += over
+                        }
+                    } else if heldFrames == nil, count / 2 > bounds.ceiling {
+                        let over = count / 2 - bounds.target
+                        drop(frames: over)
+                        stats.ceilingTrims += 1
+                        stats.trimmedFrames += over
+                    }
                 }
             }
         }
@@ -131,13 +250,25 @@ final class StereoRing: @unchecked Sendable {
         lock.withLockUnchecked {
             if trimPending, let bounds {
                 trimPending = false
-                if count / 2 > bounds.target {
-                    drop(frames: count / 2 - bounds.target)
+                let most = bounds.target + bounds.startKeep
+                if count / 2 > most {
+                    let over = count / 2 - most
+                    drop(frames: over)
                     stats.startTrims += 1
+                    stats.trimmedFrames += over
+                }
+                if count / 2 > bounds.target + bounds.excess, bounds.startHold > 0 {
+                    heldFrames = 0
+                    heldAbove = count / 2 - bounds.target
+                    stats.heldStarts += 1
+                } else {
+                    heldFrames = nil
                 }
                 windowSum = 0
                 windowFrames = 0
                 silence = 0
+                // What the output didn't play before it started is no gap.
+                silenceSinceAudio = 0
             }
             let before = count / 2
             let n = min(frames, before)
@@ -148,7 +279,10 @@ final class StereoRing: @unchecked Sendable {
                 readIndex = (readIndex + 2) % capacity
             }
             count -= n * 2
-            if let bounds { measure(before: before, after: before - n, frames: frames, bounds: bounds) }
+            if let bounds {
+                if fed { silenceSinceAudio += frames - n }
+                measure(before: before, after: before - n, frames: frames, bounds: bounds)
+            }
             return n
         }
     }
@@ -195,20 +329,50 @@ final class StereoRing: @unchecked Sendable {
     /// a time; the midpoint of before and after a read, averaged over the window, is the level the
     /// server's steering holds at its lead.
     private func measure(before: Int, after: Int, frames: Int, bounds: Bounds) {
-        silence += frames - (before - after)
+        if settling > 0 {
+            settling -= frames
+            guard settling <= 0 else { return }
+            settling = 0
+            if let ceiling = settledCeiling { self.bounds?.ceiling = ceiling }
+            settledCeiling = nil
+            windowSum = 0
+            windowFrames = 0
+            silence = 0
+            return
+        }
+        // Silence for want of a stream (before its first audio, after its last) owes nothing.
+        let missed = fed ? frames - (before - after) : 0
+        silence += missed
+        windowSilence += missed
         windowSum += (before + after) * frames
         windowFrames += frames
+        if let held = heldFrames { heldFrames = held + frames }
         guard windowFrames >= bounds.window else { return }
         let average = windowSum / (2 * windowFrames)
+        let quiet = windowSilence == 0
         windowSum = 0
         windowFrames = 0
+        windowSilence = 0
+        quietWindows = quiet ? quietWindows + 1 : 0
+        if quietWindows >= Self.silenceExpiry { silence = 0 }
+        if let held = heldFrames {
+            // Played down to the target, give or take the level's ripple (the server goes on while
+            // `heldExcess` says there is more), or the time for that is over.
+            heldAbove = max(0, average - bounds.target)
+            if average <= bounds.target + bounds.stallExcess || held >= bounds.startHold { heldFrames = nil }
+            silence = 0
+            return
+        }
         var excess = 0
         if average > bounds.target + bounds.excess {
             excess = average - bounds.target
         } else if silence > 0, average > bounds.target + bounds.stallExcess {
             excess = min(average - bounds.target, silence)
         }
-        if excess > 0 || average <= bounds.target { silence = 0 }
+        // A window that ends in the middle of a stall has a low level and silence in it: the late
+        // audio is still to come, and the silence still counts (it was forgotten here, and a 70 ms
+        // stall stayed as 25 ms of latency when a window happened to end in it).
+        if excess > 0 || (average <= bounds.target && quiet) { silence = 0 }
         guard excess > 0 else { return }
         let dropped = min(excess, count / 2)
         drop(frames: dropped)
