@@ -162,9 +162,15 @@ final class StereoRing: @unchecked Sendable {
     /// started late with the stream's beginning, or a rush in the middle of a stream. What it had at
     /// the output's first read or as the rush came, then each measuring window's average (the level
     /// itself ripples by a URB, and a look at it falls anywhere in one). Zero once that is played
-    /// down, or when nothing is held.
+    /// down, or when nothing is held. Never more than the ring has above its target at this moment:
+    /// the average is up to a window old, and said as it was it had the server slow a stream that
+    /// began a quarter of a second after the last one ended, for audio that had played out by then
+    /// (25 ms off the new stream's lead), and play a rush down some 10 ms too far.
     var heldExcess: Int {
-        lock.withLockUnchecked { heldFrames != nil ? heldAbove : 0 }
+        lock.withLockUnchecked {
+            guard heldFrames != nil, let bounds else { return 0 }
+            return min(heldAbove, max(0, count / 2 - bounds.target))
+        }
     }
 
     /// The level a playback ring holds changes (the server's lead did): the ceiling keeps its
@@ -182,6 +188,11 @@ final class StereoRing: @unchecked Sendable {
                 settling = 0
                 settledCeiling = nil
                 changed.ceiling = frames + gap
+                // A rush that is held is so much above the target as it was: late URBs grow the
+                // lead, the pacer then sends the lead's growth at once, and with the cap left
+                // where it was that much of the held rush went after all (26 ms of a 200 ms
+                // stall's, with the lead going from 40 to 200 ms).
+                if heldFrames != nil { heldCap += frames - changed.target }
             }
             changed.target = frames
             bounds = changed
@@ -205,8 +216,15 @@ final class StereoRing: @unchecked Sendable {
     /// `Bounds.startKeep` above the target, so the output starts with what the guest played while it
     /// started rather than without it; the server's steering then plays the extra down
     /// (`PlaybackSteering`), and the ring holds it meanwhile (`Bounds.startHold`).
+    ///
+    /// A hold from before is over: what the new output has to play down is told at its first read.
+    /// Left standing, it went on saying what it held while nothing read (an output changed in the
+    /// middle of a rush, the new one never starting), and the guest played a tenth slow for it.
     func outputStarts() {
-        lock.withLockUnchecked { trimPending = true }
+        lock.withLockUnchecked {
+            trimPending = true
+            heldFrames = nil
+        }
     }
 
     /// Appends interleaved 16-bit samples.

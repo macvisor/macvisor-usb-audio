@@ -247,7 +247,28 @@ final class PlaybackSimulation {
         let heard = sim.playback.statistics
         print("stall \(Int(stall * 1000)) ms: \(heard.gaps) gap(s), \(String(format: "%.0f", heard.gapSeconds * 1000)) ms of silence, \(String(format: "%.0f", heard.droppedSeconds * 1000)) ms dropped")
         #expect(heard.gaps >= 1 && heard.gaps <= 2)
-        #expect(heard.gapSeconds > stall - 0.06 && heard.gapSeconds < stall + 0.02)
+        // The stall less what was queued: the level (45 ms or so) and the URBs in flight.
+        #expect(heard.gapSeconds > max(0.003, stall - 0.075) && heard.gapSeconds < stall + 0.02)
+    }
+
+    /// The same as the server runs it, with the lead fitting itself: the late URBs of a stall grow
+    /// the lead, the pacer then sends the lead's growth at once, and the held rush's cap follows the
+    /// target up, so none of it goes (26 ms of a 200 ms stall's did, with the cap left where it was).
+    @Test(arguments: [(0.2, nil as Double?), (0.3, 0.1 as Double?)])
+    func aStallIsPlayedWhileTheLeadGrowsForIt(stall: Double, startLead: Double?) {
+        let at = 150.0 // the stream's own start is long played, and its lead is back at 40 ms
+        let sim = PlaybackSimulation(startDelay: 0.05, mostLead: 0.2, startLead: startLead)
+        sim.run(until: at)
+        let droppedBefore = sim.playback.statistics.droppedSeconds
+        let leadBefore = sim.lead
+        sim.stall(at: at, for: stall)
+        sim.run(until: at + 8)
+        let worst = sim.latencies(from: at).max()!
+        print("stall \(Int(stall * 1000)) ms with the lead fitted (\(Int(leadBefore * 1000)) ms before, \(Int(sim.lead * 1000)) ms after): worst latency \(String(format: "%.0f", worst * 1000)) ms, \(String(format: "%.0f", (sim.playback.statistics.droppedSeconds - droppedBefore) * 1000)) ms dropped")
+        #expect(sim.playback.statistics.droppedSeconds == droppedBefore)
+        #expect(worst <= sim.lead + 0.25 + 0.03) // the new lead and a rush's quarter of a second
+        #expect(sim.latencies(from: at + 6).max()! <= sim.lead + 0.025)
+        #expect(sim.underruns(from: at + stall + 0.6) == 0)
     }
 
     /// A guest that keeps submitting late (a busy guest, or vCPUs waiting for a busy Mac's cores): 80 ms
@@ -269,8 +290,8 @@ final class PlaybackSimulation {
         // The audio waits in the ring as long as the lead says, and no longer.
         let settled = fitted.latencies(from: 8)
         #expect(settled.max()! <= fitted.lead + 0.025)
-        // Nothing dropped for it but what the first stall's catching up took.
-        #expect(after.droppedSeconds <= before.droppedSeconds / 5 + 0.1)
+        // Nothing dropped for it: the first stall's late audio is played down too.
+        #expect(after.droppedSeconds <= before.droppedSeconds + 0.01)
     }
 
     /// The lead comes down again once the guest's audio has come on time for a while, 10 ms each

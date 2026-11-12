@@ -259,11 +259,11 @@ import Testing
         #expect(ring.heldExcess == 0) // nothing reads yet: nothing to play down
         var left = [Float](repeating: 0, count: 480), right = left
         #expect(ring.read(frames: 480, left: &left, right: &right) == 480)
-        #expect(ring.heldExcess == 24000 - 1920)
+        #expect(ring.heldExcess == 24000 - 480 - 1920) // what it has above the target after that read
         // The output starts again with as much: the same audio, said once.
         ring.outputStarts()
         #expect(ring.read(frames: 480, left: &left, right: &right) == 480)
-        #expect(ring.heldExcess == 24000 - 480 - 1920)
+        #expect(ring.heldExcess == 24000 - 960 - 1920)
         // Played down to the usual bounds: none.
         for _ in 0 ..< 100 { _ = ring.read(frames: 480, left: &left, right: &right) } // a second: four windows
         #expect(ring.heldExcess == 0)
@@ -494,6 +494,66 @@ import Testing
         #expect(reads > 100 && reads < 200) // 7200 frames at 48 a read
         #expect(ring.bufferedFrames <= 1920 + 480)
         #expect(ring.statistics.trimmedFrames == 0 && ring.statistics.excessFrames == 0) // nothing skipped
+    }
+
+    /// What a held ring says it holds is never more than it has above its target at that moment:
+    /// a stream that ended plays out, and the next one isn't slowed for audio that is gone.
+    @Test func aHeldRingSaysNoMoreThanItHasNow() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        var left = [Float](repeating: 0, count: 480), right = left
+        var next = 0
+        func write(_ frames: Int) { ring.write(int16: tagged(first: next, frames: frames)); next += frames }
+        write(1920)
+        for _ in 0 ..< 100 { write(480); _ = ring.read(frames: 480, left: &left, right: &right) }
+        write(7200)
+        #expect(ring.heldExcess == 7200)
+        // The stream ends, and what the ring holds plays out: 190 ms in 19 reads.
+        ring.streamEnded()
+        for _ in 0 ..< 19 { _ = ring.read(frames: 480, left: &left, right: &right) }
+        #expect(ring.bufferedFrames == 0)
+        #expect(ring.heldExcess == 0) // though the last window's average was well above the target
+        // The next stream's first audio is not a backlog either.
+        write(1920)
+        #expect(ring.heldExcess == 0)
+    }
+
+    /// An output that starts in the middle of a hold (the Mac's output changed) begins its own
+    /// account at its first read: until then the ring says it holds nothing to play down, so the
+    /// guest isn't slowed for an output that never reads.
+    @Test func anOutputStartingEndsAHoldUntilItReads() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        var left = [Float](repeating: 0, count: 480), right = left
+        var next = 0
+        func write(_ frames: Int) { ring.write(int16: tagged(first: next, frames: frames)); next += frames }
+        write(1920)
+        for _ in 0 ..< 100 { write(480); _ = ring.read(frames: 480, left: &left, right: &right) }
+        write(7200)
+        #expect(ring.heldExcess == 7200)
+        ring.outputStarts()
+        #expect(ring.heldExcess == 0)
+        for _ in 0 ..< 100 { write(480) } // a second with nothing reading
+        #expect(ring.heldExcess == 0)
+        #expect(ring.bufferedFrames <= 1920 + 36000 + 960) // what an output that starts is kept
+        // It reads: the stream from where the ring has it, held for the server to play down.
+        #expect(ring.read(frames: 480, left: &left, right: &right) == 480)
+        #expect(ring.heldExcess > 0 && ring.statistics.heldStarts == 1)
+    }
+
+    /// The lead grows while a rush is held (the stall's late URBs grew it): the ring keeps the rush
+    /// above the new target, as much as it kept above the old.
+    @Test func aHeldRushKeepsItsRoomWhenTheTargetRises() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        var left = [Float](repeating: 0, count: 480), right = left
+        var next = 0
+        func write(_ frames: Int) { ring.write(int16: tagged(first: next, frames: frames)); next += frames }
+        write(1920)
+        for _ in 0 ..< 100 { write(480); _ = ring.read(frames: 480, left: &left, right: &right) }
+        write(9600) // 200 ms at once
+        #expect(ring.heldExcess == 9600)
+        ring.setTarget(frames: 9600) // the lead goes from 40 to 200 ms
+        write(7680) // and the pacer sends the difference at once
+        #expect(ring.bufferedFrames == 1920 + 9600 + 7680)
+        #expect(ring.statistics.trimmedFrames == 0 && ring.statistics.excessFrames == 0)
     }
 
     /// A rush nobody plays down (nothing steers this ring's source) goes after all, once the time
