@@ -28,10 +28,14 @@ import USBAudioDevice
 /// **Latency.** The server completes playback URBs 40 ms (its lead) before their audio is due, so the
 /// guest keeps that much queued, and that much is what the ring holds (`StereoRing.Bounds.playback`):
 /// - an engine that starts has more for a while, as above;
-/// - otherwise a write past 100 ms drops the oldest audio down to 40 ms;
-/// - a stall: the output plays silence, then the late URBs catch up at once, and the ring would keep
-///   the stall as latency. A quarter of a second averaging more than 20 ms above the target drops the
-///   excess.
+/// - a rush in the middle of a stream (a write past 100 ms, or a quarter of a second averaging more
+///   than 20 ms above the target: a guest that stalled, so the output played silence, then sent its
+///   late audio at once; an output that missed cycles) is played, not dropped: the ring keeps up to
+///   a quarter of a second of it above the target (`StereoRing.Bounds.rushKeep`), and the server's
+///   steering has the guest send a tenth slower until it is played down, ten times its length on.
+///   It was dropped until 12 Nov 2026, so a gap was followed by a skip as long (70 ms of a Windows
+///   guest's sign-in sound). More than a quarter of a second, or a rush nothing plays down in half
+///   a minute, still goes.
 /// `bufferedSeconds` reports the level; the server steers its pacer to hold it at its lead, so the
 /// guest follows the output device's clock. A server whose lead grows because the guest's audio comes
 /// late says so (`playbackLead`), and the ring holds that much, with the same room above it.
@@ -159,8 +163,8 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         request(streaming: false)
     }
 
-    /// What an output that started late still holds of the stream's beginning, for the server to
-    /// play down.
+    /// What the ring holds above its level for the server to play down: the stream's beginning,
+    /// for an output that started late, or a rush in the middle of a stream.
     public var startBacklog: Double {
         Double(ring.heldExcess) / Double(UAC1AudioDevice.sampleRate)
     }

@@ -219,24 +219,30 @@ final class PlaybackSimulation {
         #expect(heard.gaps == 0 && heard.gapSeconds == 0 && heard.droppedSeconds < 0.08)
     }
 
-    /// The guest stalls: the output plays silence, then the late URBs catch up all at once. What
-    /// the stall would leave as latency goes within a window or two.
+    /// The guest stalls: the output plays silence, then the late URBs catch up all at once. That
+    /// audio is played, not skipped: the ring holds it and the steering has the guest send a tenth
+    /// slower until it is played down, ten times the stall's length on, so the stall doesn't stay
+    /// as latency either. (It was dropped within a window or two: a gap, then a skip as long.)
     @Test(arguments: [0.07, 0.1, 0.15, 0.3])
-    func aStallDoesNotStayAsLatency(stall: Double) {
+    func aStallIsPlayedAndDoesNotStayAsLatency(stall: Double) {
         // Half a minute in: the little an output's start leaves above the lead is played by then.
         let at = 30.0
         let sim = PlaybackSimulation(startDelay: 0.05)
+        sim.run(until: at)
+        let droppedBefore = sim.playback.statistics.droppedSeconds
         sim.stall(at: at, for: stall)
-        sim.run(until: at + 5)
+        sim.run(until: at + 6)
         let before = sim.latencies(from: at - 2, to: at)
-        let after = sim.latencies(from: at + stall + 0.6)
+        // Played down by a tenth of real time, and a second for the steering to settle.
+        let settledAt = at + stall + 10 * stall + 1
+        let after = sim.latencies(from: settledAt)
         let worst = sim.latencies(from: at).max()!
-        print("stall \(Int(stall * 1000)) ms: latency before \(PlaybackSimulation.ms(before)); worst after it \(String(format: "%.1f", worst * 1000)) ms; 0.6 s on \(PlaybackSimulation.ms(after))")
-        #expect(worst <= 0.1) // never past the ceiling
-        // Back at the target, give or take what one trim leaves for the steering (the 70 ms stall
-        // used to stay at 54–64 ms; the 150 ms one is 47–57 ms here, 12 ms the steering takes back).
-        #expect(after.max()! <= 0.06)
+        print("stall \(Int(stall * 1000)) ms: latency before \(PlaybackSimulation.ms(before)); worst after it \(String(format: "%.1f", worst * 1000)) ms; from \(String(format: "%.1f", settledAt - at)) s on \(PlaybackSimulation.ms(after))")
+        #expect(worst <= 0.04 + stall + 0.02) // the lead and the stall, never more
+        #expect(worst <= 0.04 + 0.25 + 0.02) // nor more than a rush's quarter of a second
+        #expect(after.max()! <= 0.06) // back at the target
         #expect(sim.underruns(from: at + stall + 0.6) == 0)
+        #expect(sim.playback.statistics.droppedSeconds == droppedBefore) // nothing skipped
         // The stall is said as one gap: the silence the output played past the lead, about.
         let heard = sim.playback.statistics
         print("stall \(Int(stall * 1000)) ms: \(heard.gaps) gap(s), \(String(format: "%.0f", heard.gapSeconds * 1000)) ms of silence, \(String(format: "%.0f", heard.droppedSeconds * 1000)) ms dropped")

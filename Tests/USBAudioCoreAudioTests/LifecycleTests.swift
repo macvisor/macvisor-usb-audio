@@ -436,17 +436,83 @@ import Testing
         #expect(ring.read(frames: 1, left: &left, right: &right) == 1)
         #expect(ring.statistics.heldStarts == 0)
         for urb in 0 ..< 50 { ring.write(int16: tagged(first: 1920 + urb * 480, frames: 480)) }
-        #expect(ring.bufferedFrames <= 4800) // the ceiling holds
+        // A rush from here on: a quarter of a second of it is kept above the target, no more.
+        #expect(ring.bufferedFrames <= 1920 + 12000 + 960)
+        #expect(ring.statistics.heldRushes == 1)
     }
 
-    /// Nothing reads while an output starts: the ring stays between the target and the ceiling.
-    @Test func writesPastTheCeilingDropToTheTarget() {
+    /// Nothing reads (an output that failed to start, say): the ring keeps a rush's quarter of a
+    /// second above the target and drops the oldest of more, so what it holds stays bounded.
+    @Test func writesWithNothingReadingKeepARushAndNoMore() {
         let ring = StereoRing(capacitySeconds: 0.5, bounds: .playback)
+        for urb in 0 ..< 50 {
+            ring.write(int16: tagged(first: urb * 480, frames: 480))
+            #expect(ring.bufferedFrames <= 1920 + 12000 + 960)
+        }
+        #expect(ring.bufferedFrames >= 1920 + 12000)
+        #expect(ring.statistics.heldRushes == 1 && ring.statistics.ceilingTrims > 0)
+    }
+
+    /// A ring whose bounds keep no rush (a sink nothing steers) drops to the target at the ceiling,
+    /// as every ring did before 12 Nov 2026.
+    @Test func writesPastTheCeilingDropToTheTargetWithoutARushKept() {
+        var bounds = StereoRing.Bounds.playback
+        bounds.rushKeep = 0
+        let ring = StereoRing(capacitySeconds: 0.5, bounds: bounds)
         for urb in 0 ..< 50 {
             ring.write(int16: tagged(first: urb * 480, frames: 480))
             #expect(ring.bufferedFrames <= 4800)
         }
         #expect(ring.bufferedFrames >= 1920)
+        #expect(ring.statistics.heldRushes == 0)
+    }
+
+    /// A rush in the middle of a stream is kept whole and said to the server (`heldExcess`), which
+    /// plays it down; the ring lets go of the hold once its level is back at the target. It used to
+    /// drop what was above the target: a skip as long as the gap before it.
+    @Test func aRushIsHeldForTheServerToPlayDown() {
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: .playback)
+        var left = [Float](repeating: 0, count: 480), right = left
+        var next = 0
+        func write(_ frames: Int) { ring.write(int16: tagged(first: next, frames: frames)); next += frames }
+        // Steady at the target: a URB in, a URB out.
+        write(1920)
+        for _ in 0 ..< 100 { write(480); _ = ring.read(frames: 480, left: &left, right: &right) }
+        #expect(ring.heldExcess == 0)
+        // 150 ms comes at once.
+        write(7200)
+        #expect(ring.bufferedFrames == 1920 + 7200)
+        #expect(ring.heldExcess == 7200)
+        #expect(ring.statistics.heldRushes == 1 && ring.statistics.trimmedFrames == 0 && ring.statistics.excessFrames == 0)
+        // The server has the guest send a tenth less: 432 frames in for each 480 out.
+        var reads = 0
+        while ring.heldExcess > 0, reads < 2000 {
+            write(432)
+            _ = ring.read(frames: 480, left: &left, right: &right)
+            reads += 1
+        }
+        #expect(reads > 100 && reads < 200) // 7200 frames at 48 a read
+        #expect(ring.bufferedFrames <= 1920 + 480)
+        #expect(ring.statistics.trimmedFrames == 0 && ring.statistics.excessFrames == 0) // nothing skipped
+    }
+
+    /// A rush nobody plays down (nothing steers this ring's source) goes after all, once the time
+    /// the server has for it is over: the latency doesn't stay.
+    @Test func aRushNobodyPlaysDownIsDroppedInTheEnd() {
+        var bounds = StereoRing.Bounds.playback
+        bounds.startHold = StereoRing.Bounds.frames(ms: 1000)
+        let ring = StereoRing(capacitySeconds: 1.5, bounds: bounds)
+        var left = [Float](repeating: 0, count: 480), right = left
+        var next = 0
+        func write(_ frames: Int) { ring.write(int16: tagged(first: next, frames: frames)); next += frames }
+        write(1920)
+        for _ in 0 ..< 100 { write(480); _ = ring.read(frames: 480, left: &left, right: &right) }
+        write(7200)
+        #expect(ring.heldExcess == 7200)
+        for _ in 0 ..< 150 { write(480); _ = ring.read(frames: 480, left: &left, right: &right) } // a second and a half
+        #expect(ring.heldExcess == 0)
+        #expect(ring.statistics.excessTrims == 1 && ring.statistics.excessFrames >= 7200 - 480)
+        #expect(ring.bufferedFrames <= 1920 + 480)
     }
 
     /// The host starts asking for microphone audio late, or a fast microphone fills the ring: the

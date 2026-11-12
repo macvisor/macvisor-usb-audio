@@ -13,8 +13,9 @@ public protocol PlaybackSink: AnyObject, Sendable {
     /// none does nothing; one that wraps another passes it on. (No default, like `startBacklog`: a
     /// wrapper that didn't pass them on left its sink at the wrong level, unnoticed.)
     func playbackLead(_ seconds: Double)
-    /// What the sink holds above its level now because its output started after the stream did and
-    /// has the stream's beginning to play, in seconds; zero when it holds none, or is no such sink.
+    /// What the sink holds above its level now for the server to play down, in seconds: the
+    /// stream's beginning, where its output started after the stream did, or audio that came in a
+    /// rush in the middle of one. Zero when it holds none, or is no such sink.
     /// The server has the guest send a little slower while there is some (`PlaybackSteering`).
     var startBacklog: Double { get }
 }

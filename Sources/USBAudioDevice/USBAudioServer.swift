@@ -433,8 +433,9 @@ public final class USBAudioServer: @unchecked Sendable {
 /// Locks the playback timeline to the sink's clock: when the sink's buffer grows the pacer slows, when
 /// it drains the pacer speeds up (a few hundred ppm at most; clock drift is tens of ppm).
 ///
-/// A sink whose output started late with the stream's beginning kept for it says how much more than
-/// the set point it holds for that (`PlaybackSink.startBacklog`, `CoreAudioPlayback`): while it holds
+/// A sink that holds more than the set point for the server to play down (its output started late
+/// with the stream's beginning kept for it, or the guest's audio came in a rush after a stall) says
+/// how much (`PlaybackSink.startBacklog`, `CoreAudioPlayback`): while it holds
 /// more than `backlogFloor` the pacer runs up to a tenth slow, half a second in five, so the guest
 /// sends that much less than the output plays and nothing is skipped. The guest's audio clock is the
 /// pacer, so what it plays keeps time with it. The drift correction rests meanwhile, and starts over

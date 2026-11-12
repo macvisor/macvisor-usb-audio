@@ -11,16 +11,20 @@ final class StereoRing: @unchecked Sendable {
     struct Bounds: Sendable {
         /// The level the ring holds: the server's lead, which the guest keeps queued.
         var target: Int
-        /// A write past it drops the oldest audio down to `target`, so the latency never exceeds it
-        /// (an output that is starting, or failed to, reads nothing).
+        /// A write past it is a rush: more than the ring should hold, all at once (an output that is
+        /// starting, or failed to, reads nothing; a guest that stalled sends its late audio together).
+        /// With `rushKeep` it is held for the server to play down; without, the oldest audio is
+        /// dropped down to `target`.
         var ceiling: Int
-        /// A window of reads whose level averages more than `target + excess` drops what's above
-        /// `target` (the output missed cycles, say, while the guest's URBs kept coming).
+        /// A window of reads whose level averages more than `target + excess` has too much (the
+        /// output missed cycles, say, while the guest's URBs kept coming): held to be played down
+        /// with `rushKeep`, else what's above `target` is dropped.
         var excess: Int
         /// A stall: the output plays silence, then the late URBs catch up all at once, and the ring
         /// would keep the stall as latency. After silence, a window averaging more than
-        /// `target + stallExcess` drops what's above `target`, up to the silence played. Never more:
-        /// silence for want of audio (before a stream's first URB, between streams) owes nothing.
+        /// `target + stallExcess` has what's above `target` played down (`rushKeep`) or dropped, up
+        /// to the silence played. Never more: silence for want of audio (before a stream's first
+        /// URB, between streams) owes nothing.
         var stallExcess: Int
         /// The frames read per window: many output cycles (512 frames each) and URBs (480 each), so
         /// the average doesn't depend on where in their cycles a read falls.
@@ -33,13 +37,23 @@ final class StereoRing: @unchecked Sendable {
         /// server's steering plays it down (`PlaybackSteering`), before what's above counts as too
         /// much after all.
         var startHold = 0
+        /// Audio that comes in a rush in the middle of a stream (a guest that sent nothing for a
+        /// moment and then all of it at once, an output that missed cycles) is played, not dropped:
+        /// what the ring keeps of it above `target`, for the server's steering to play down as it
+        /// does a late start's beginning, within `startHold`. More than this goes, the oldest
+        /// first. Zero: what is above `target` is dropped, as it was before 12 Nov 2026 (a gap was
+        /// then followed by a skip of its length: 70 ms of a sign-in sound, in a Windows guest
+        /// that was late in the stream's first moments).
+        var rushKeep = 0
 
-        /// The server's 40 ms lead, never more than 100 ms; a stall leaves at most 5 ms behind it
-        /// after a window or two (a quarter of a second each). An output that starts has up to
-        /// three quarters of a second of the stream's beginning, and half a minute to play it down.
+        /// The server's 40 ms lead; past 100 ms the ring is holding a rush, a quarter of a second of
+        /// it at the most, which the steering plays down in ten times its length. A stall leaves at
+        /// most 5 ms behind it once that is done. An output that starts has up to three quarters of
+        /// a second of the stream's beginning. Either has half a minute to be played down.
         static let playback = Bounds(target: frames(ms: 40), ceiling: frames(ms: 100), excess: frames(ms: 20),
                                      stallExcess: frames(ms: 5), window: frames(ms: 250),
-                                     startKeep: frames(ms: 750), startHold: frames(ms: 30000))
+                                     startKeep: frames(ms: 750), startHold: frames(ms: 30000),
+                                     rushKeep: frames(ms: 250))
 
         static func frames(ms: Int) -> Int { 48 * ms }
     }
@@ -54,6 +68,8 @@ final class StereoRing: @unchecked Sendable {
         var startTrims = 0
         /// Outputs that started with more than the target and `excess`, for the steering to play down.
         var heldStarts = 0
+        /// Rushes in the middle of a stream kept for the steering to play down (`Bounds.rushKeep`).
+        var heldRushes = 0
         /// The frames the drops at `Bounds.ceiling` and at an output's start took.
         var trimmedFrames = 0
         /// Gaps: times the output ran out of audio in the middle of a stream (it played silence, and
@@ -93,8 +109,12 @@ final class StereoRing: @unchecked Sendable {
     /// After an output started with the stream's beginning: the frames read since, while the ring
     /// may hold more than its target (`Bounds.startHold`); nil otherwise.
     private var heldFrames: Int?
-    /// What the held ring had above its target at the output's first read, or in its last window.
+    /// What the held ring had above its target at the output's first read or as a rush came, or in
+    /// its last window.
     private var heldAbove = 0
+    /// The most the ring keeps while it is held, in frames: the target and `Bounds.startKeep` after
+    /// an output's start, the target and `Bounds.rushKeep` after a rush.
+    private var heldCap = 0
     /// Windows read without silence since the last one that had some (`silenceExpiry`).
     private var quietWindows = 0
     /// A stall's late audio comes within a window or two of its end: silence older than this many
@@ -138,10 +158,11 @@ final class StereoRing: @unchecked Sendable {
         }
     }
 
-    /// What the ring holds above its target for an output that started late with the stream's
-    /// beginning, in frames: what it had at the output's first read, then each measuring window's
-    /// average (the level itself ripples by a URB, and a look at it falls anywhere in one). Zero once
-    /// that is played down, or when no output started so.
+    /// What the ring holds above its target for the server to play down, in frames: an output that
+    /// started late with the stream's beginning, or a rush in the middle of a stream. What it had at
+    /// the output's first read or as the rush came, then each measuring window's average (the level
+    /// itself ripples by a URB, and a look at it falls anywhere in one). Zero once that is played
+    /// down, or when nothing is held.
     var heldExcess: Int {
         lock.withLockUnchecked { heldFrames != nil ? heldAbove : 0 }
     }
@@ -221,11 +242,25 @@ final class StereoRing: @unchecked Sendable {
                             stats.startTrims += 1
                             stats.trimmedFrames += over
                         }
-                    } else if heldFrames == nil, count / 2 > bounds.ceiling {
-                        let over = count / 2 - bounds.target
-                        drop(frames: over)
-                        stats.ceilingTrims += 1
-                        stats.trimmedFrames += over
+                    } else if heldFrames != nil {
+                        // Held for the steering to play down: no more than it was held with.
+                        if count / 2 > heldCap + bounds.excess {
+                            let over = count / 2 - heldCap
+                            drop(frames: over)
+                            stats.ceilingTrims += 1
+                            stats.trimmedFrames += over
+                        }
+                    } else if count / 2 > bounds.ceiling {
+                        if bounds.rushKeep > 0, bounds.startHold > 0 {
+                            // A rush: kept, and said to the server (`heldExcess`), which has the
+                            // guest send a little slower until it is played.
+                            hold(above: bounds.target, keeping: bounds.rushKeep)
+                        } else {
+                            let over = count / 2 - bounds.target
+                            drop(frames: over)
+                            stats.ceilingTrims += 1
+                            stats.trimmedFrames += over
+                        }
                     }
                 }
             }
@@ -260,6 +295,7 @@ final class StereoRing: @unchecked Sendable {
                 if count / 2 > bounds.target + bounds.excess, bounds.startHold > 0 {
                     heldFrames = 0
                     heldAbove = count / 2 - bounds.target
+                    heldCap = most
                     stats.heldStarts += 1
                 } else {
                     heldFrames = nil
@@ -317,6 +353,27 @@ final class StereoRing: @unchecked Sendable {
 
     // MARK: - With the lock held
 
+    /// A rush in the middle of a stream is held for the steering to play down: the ring keeps up to
+    /// `keeping` frames of it above `target`, the oldest of more going, and says what it holds
+    /// (`heldExcess`). The windows measured so far say nothing about it.
+    private func hold(above target: Int, keeping: Int) {
+        let most = target + keeping
+        if count / 2 > most {
+            let over = count / 2 - most
+            drop(frames: over)
+            stats.ceilingTrims += 1
+            stats.trimmedFrames += over
+        }
+        heldFrames = 0
+        heldAbove = max(0, count / 2 - target)
+        heldCap = most
+        stats.heldRushes += 1
+        windowSum = 0
+        windowFrames = 0
+        windowSilence = 0
+        silence = 0
+    }
+
     /// Drops the oldest `frames` frames (at most what the ring holds).
     private func drop(frames: Int) {
         let n = max(0, min(frames, count / 2))
@@ -324,8 +381,8 @@ final class StereoRing: @unchecked Sendable {
         count -= n * 2
     }
 
-    /// Adds a read to the window; at the window's end, drops what sits above the target without
-    /// need (`Bounds.excess`, `Bounds.stallExcess`). The level falls by a read and rises by a URB at
+    /// Adds a read to the window; at the window's end, has what sits above the target without
+    /// need played down or dropped (`Bounds.excess`, `Bounds.stallExcess`). The level falls by a read and rises by a URB at
     /// a time; the midpoint of before and after a read, averaged over the window, is the level the
     /// server's steering holds at its lead.
     private func measure(before: Int, after: Int, frames: Int, bounds: Bounds) {
@@ -357,9 +414,20 @@ final class StereoRing: @unchecked Sendable {
         if quietWindows >= Self.silenceExpiry { silence = 0 }
         if let held = heldFrames {
             // Played down to the target, give or take the level's ripple (the server goes on while
-            // `heldExcess` says there is more), or the time for that is over.
+            // `heldExcess` says there is more), or the time for that is over: nothing steers this
+            // ring's source, and what is still above the target goes after all.
             heldAbove = max(0, average - bounds.target)
-            if average <= bounds.target + bounds.stallExcess || held >= bounds.startHold { heldFrames = nil }
+            if average <= bounds.target + bounds.stallExcess {
+                heldFrames = nil
+            } else if held >= bounds.startHold {
+                heldFrames = nil
+                if average > bounds.target + bounds.excess {
+                    let dropped = min(average - bounds.target, count / 2)
+                    drop(frames: dropped)
+                    stats.excessTrims += 1
+                    stats.excessFrames += dropped
+                }
+            }
             silence = 0
             return
         }
@@ -374,6 +442,12 @@ final class StereoRing: @unchecked Sendable {
         // stall stayed as 25 ms of latency when a window happened to end in it).
         if excess > 0 || (average <= bounds.target && quiet) { silence = 0 }
         guard excess > 0 else { return }
+        if bounds.rushKeep > 0, bounds.startHold > 0 {
+            // Played down, not dropped: the late audio of a stall, or what an output that missed
+            // cycles left behind.
+            hold(above: bounds.target, keeping: bounds.rushKeep)
+            return
+        }
         let dropped = min(excess, count / 2)
         drop(frames: dropped)
         stats.excessTrims += 1
