@@ -81,24 +81,35 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     private var generation = 0
     /// Between playbackStarted and playbackStopped, as `reconcile` last acted on it.
     private var streaming = false
-    /// When the idle timer pauses the output (nil: it doesn't).
+    /// When the idle timer pauses the output (nil: it doesn't). While the host streams, when it looks
+    /// whether the guest still sends audio (`stallStop`).
     private var idleStopAt: DispatchTime?
     private var backoff = StartBackoff()
+    /// How long a stream may send no audio before the output pauses (nil: never).
+    private let stallStop: TimeInterval?
+    /// When `play` last had audio (uptime nanoseconds), from the server's thread.
+    private let playedLock = NSLock()
+    private var lastPlayed: UInt64 = 0
 
     /// - Parameters:
     ///   - idleStop: how long the output runs on after a stream.
     ///   - wiredIdleStop: how long it does where the Mac's output is wired.
-    public convenience init(idleStop: TimeInterval = 30, wiredIdleStop: TimeInterval = 120) {
-        self.init(idleStop: idleStop, wiredIdleStop: wiredIdleStop, bounds: .playback) { ring, changed in
+    ///   - stallStop: how long it runs on in a stream that has sent no audio, as a paused VM's
+    ///     doesn't: as long as after a stream on Bluetooth, and no longer where it is wired, as a
+    ///     paused VM has no next sound waiting to be heard sooner.
+    public convenience init(idleStop: TimeInterval = 30, wiredIdleStop: TimeInterval = 120, stallStop: TimeInterval = 30) {
+        self.init(idleStop: idleStop, wiredIdleStop: wiredIdleStop, stallStop: stallStop, bounds: .playback) { ring, changed in
             try EnginePlaybackOutput(ring: ring, changed: changed)
         }
     }
 
     /// `makeOutput` builds an output reading `ring`, which calls `changed` when the Mac's output
     /// device changes under it, or throws when it can't be built (tests pass a stand-in).
-    init(idleStop: TimeInterval, wiredIdleStop: TimeInterval? = nil, bounds: StereoRing.Bounds, makeOutput: @escaping MakePlaybackOutput) {
+    init(idleStop: TimeInterval, wiredIdleStop: TimeInterval? = nil, stallStop: TimeInterval? = nil, bounds: StereoRing.Bounds,
+         makeOutput: @escaping MakePlaybackOutput) {
         self.idleStop = idleStop
         self.wiredIdleStop = wiredIdleStop ?? idleStop
+        self.stallStop = stallStop
         ring = StereoRing(capacitySeconds: Self.ringSeconds, bounds: bounds)
         self.makeOutput = makeOutput
         idleTimer = DispatchSource.makeTimerSource(queue: queue)
@@ -154,6 +165,8 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     }
 
     public func play(_ pcm: Data) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        playedLock.withLock { lastPlayed = now }
         ring.write(int16: pcm)
         // The output's check, with the stream's events: one block for all of them.
         request(streaming: nil)
@@ -202,6 +215,7 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
             }
         }
         guard streaming else { return }
+        watchStream()
         if let output {
             if paused {
                 resumeOutput(output)
@@ -220,12 +234,31 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         idleTimer.schedule(deadline: at ?? .distantFuture)
     }
 
-    /// On the queue: a fire from before the timer was set again stops nothing.
+    /// On the queue, while the host streams: has the idle timer look, `stallStop` on, whether the
+    /// guest still sends audio (13 Nov 2026). A paused VM leaves its stream open and sends nothing, and
+    /// the output played silence for as long as it stayed paused, holding off the Mac's idle sleep and
+    /// keeping a Bluetooth headset streaming; the microphone already closed for it.
+    private func watchStream() {
+        guard streaming, idleStopAt == nil, let stallStop else { return }
+        setIdleStop(.now() + stallStop)
+    }
+
+    /// On the queue: a fire from before the timer was set again stops nothing. In a stream, the output
+    /// pauses once the guest has sent no audio for `stallStop`; its next audio starts it again
+    /// (`reconcile`).
     private func idleTimerFired() {
-        guard let at = idleStopAt, !streaming else { return }
+        guard var at = idleStopAt else { return }
+        if streaming {
+            guard let stallStop else { return }
+            let played = DispatchTime(uptimeNanoseconds: playedLock.withLock { lastPlayed })
+            at = max(at, played + stallStop)
+        }
         guard DispatchTime.now() >= at else {
-            idleTimer.schedule(deadline: at)
+            setIdleStop(at)
             return
+        }
+        if streaming, output != nil {
+            log?("playback: the guest has sent no audio in \(stallStop ?? 0) s (a paused VM?); pausing the output engine until it does")
         }
         pauseOutput()
     }
@@ -291,6 +324,7 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
                 throw error
             }
             self.output = output
+            watchStream() // a rebuild after a change starts here, not in `reconcile`
             let after = backoff.succeeded(at: Date())
             log?("playback: output engine started (\(output.formatDescription))\(Self.took(since: began))\(after > 0 ? " after \(after) failed attempt(s)" : "")")
         } catch {
@@ -305,7 +339,8 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
     /// starts it.
     private func outputChanged(generation changed: Int) {
         guard changed == generation, output != nil else { return }
-        guard streaming else {
+        // Paused in a stream the guest sends nothing in: as paused after one.
+        guard streaming, !paused else {
             log?("playback: the Mac's output changed while no stream plays")
             stopOutput()
             return

@@ -140,6 +140,45 @@ import Testing
         #expect(lines.filter { $0.contains("output engine started again") }.count == 1)
     }
 
+    /// A paused VM leaves its stream open and sends nothing: the output used to play silence for as
+    /// long as it stayed paused, holding off the Mac's idle sleep. It pauses once the stream has had
+    /// no audio for `stallStop`, the guest's next audio starts it again, and a change of the Mac's
+    /// output meanwhile lets it go rather than starting one for a stream that sends nothing.
+    @Test func aStreamThatSendsNothingPausesTheOutputAndItsNextAudioStartsItAgain() throws {
+        let outputs = FakeOutputs()
+        let sink = CoreAudioPlayback(idleStop: 30, stallStop: 0.3, bounds: .playback) { try outputs.make($0, $1) }
+        let said = Box<[String]>([])
+        sink.log = { line in said.mutate { $0.append(line) } }
+        sink.playbackStarted()
+        sink.waitForQueue()
+        let output = try #require(outputs.all.first)
+        // Audio coming keeps it running, past the stall time.
+        for _ in 0 ..< 30 {
+            sink.play(Data(count: 1920))
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        sink.waitForQueue()
+        #expect(output.isRunning && output.pauseCount == 0)
+        // None: it pauses.
+        #expect(eventually { output.pauseCount == 1 && !output.isRunning })
+        #expect(output.stopCount == 0)
+        #expect(said.value.contains { $0.contains("sent no audio") })
+        // The guest's next audio starts the same output again, and the watch with it.
+        sink.play(Data(count: 1920))
+        sink.waitForQueue()
+        #expect(outputs.all.count == 1 && output.isRunning && output.startCount == 2)
+        #expect(eventually { output.pauseCount == 2 && !output.isRunning })
+        // A change of the Mac's output while paused builds nothing until audio comes.
+        output.deviceChanged()
+        #expect(eventually { output.stopCount == 1 })
+        Thread.sleep(forTimeInterval: 1.2) // past the second a rebuild waits for
+        sink.waitForQueue()
+        #expect(outputs.all.count == 1)
+        sink.play(Data(count: 1920))
+        sink.waitForQueue()
+        #expect(outputs.all.count == 2 && outputs.all[1].isRunning)
+    }
+
     /// On a wired output the engine runs on for longer after a stream (two minutes in use), since
     /// starting the Mac's audio hardware costs each stream its first half second; on a wireless one,
     /// which a silent stream holds and drains, for the short time.
