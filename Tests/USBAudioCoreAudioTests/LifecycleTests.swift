@@ -179,6 +179,18 @@ import Testing
         #expect(outputs.all.count == 2 && outputs.all[1].isRunning)
     }
 
+    /// A stream on a sink that has never had audio (a VM paused just after it opened its stream)
+    /// pauses the output too, `stallStop` after the stream's start.
+    @Test func aStreamThatNeverSendsAudioPausesTheOutput() throws {
+        let outputs = FakeOutputs()
+        let sink = CoreAudioPlayback(idleStop: 30, stallStop: 0.3, bounds: .playback) { try outputs.make($0, $1) }
+        sink.playbackStarted()
+        sink.waitForQueue()
+        let output = try #require(outputs.all.first)
+        #expect(output.isRunning)
+        #expect(eventually { output.pauseCount == 1 && !output.isRunning })
+    }
+
     /// On a wired output the engine runs on for longer after a stream (two minutes in use), since
     /// starting the Mac's audio hardware costs each stream its first half second; on a wireless one,
     /// which a silent stream holds and drains, for the short time.

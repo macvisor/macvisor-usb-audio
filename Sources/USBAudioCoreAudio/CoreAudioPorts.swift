@@ -250,8 +250,10 @@ public final class CoreAudioPlayback: PlaybackSink, @unchecked Sendable {
         guard var at = idleStopAt else { return }
         if streaming {
             guard let stallStop else { return }
-            let played = DispatchTime(uptimeNanoseconds: playedLock.withLock { lastPlayed })
-            at = max(at, played + stallStop)
+            // None yet: the watch's own time, from the stream's start, stands. (DispatchTime of 0 is
+            // DISPATCH_TIME_NOW, which kept a stream with no audio from ever pausing.)
+            let last = playedLock.withLock { lastPlayed }
+            if last > 0 { at = max(at, DispatchTime(uptimeNanoseconds: last) + stallStop) }
         }
         guard DispatchTime.now() >= at else {
             setIdleStop(at)
