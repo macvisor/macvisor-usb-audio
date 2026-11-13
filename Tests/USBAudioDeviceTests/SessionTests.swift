@@ -58,6 +58,34 @@ final class CountingSource: CaptureSource, @unchecked Sendable {
         #expect(try client.readReply() == .unlink(sequence: unlink, status: USBIP.Status.ok))
     }
 
+    /// CMD_UNLINKs for URBs no pacer holds, from a host that reads nothing: their answers wait on the
+    /// pacers' queues, and grew the runner's memory without bound; past `mostPendingUnlinks` the
+    /// session ends. A burst a host could really send, read late, is answered whole.
+    @Test func unlinksFromAHostThatReadsNothingEndTheSession() throws {
+        let server = USBAudioServer(playback: NullSink(), capture: SilentSource(), lead: 0)
+        let said = Locked<[String]>([])
+        server.log = { line in said.mutate { $0.append(line) } }
+        let client = TestClient()
+        startServing(server, client)
+        #expect(try client.importDevice())
+        let burst = try (0 ..< 200).map { _ in try client.unlink(0xDEAD) } // more than a socket buffer of answers
+        Thread.sleep(forTimeInterval: 0.2)
+        for sequence in burst { #expect(try client.readReply() == .unlink(sequence: sequence, status: USBIP.Status.ok)) }
+        #expect(server.isAttached)
+        var sent = 0
+        do {
+            while sent < 100_000 {
+                _ = try client.unlink(0xDEAD)
+                sent += 1
+            }
+        } catch {}
+        #expect(sent < 100_000)
+        let end = Date().addingTimeInterval(2)
+        while server.isAttached, Date() < end { Thread.sleep(forTimeInterval: 0.01) }
+        #expect(!server.isAttached)
+        #expect(said.value.contains { $0.contains("tooManyUnansweredUnlinks") })
+    }
+
     @Test func unlinkingAPendingCaptureURBSendsOnlyRetUnlink() throws {
         let clock = ManualClock()
         let server = USBAudioServer(playback: NullSink(), capture: SilentSource(), lead: 0, clock: clock)

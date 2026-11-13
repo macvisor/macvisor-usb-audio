@@ -56,6 +56,9 @@ public enum USBIP {
         case isoPacketOutOfRange
         /// A direction other than OUT (0) and IN (1).
         case invalidDirection(UInt32)
+        /// More RET_UNLINKs waiting to go out than a host has URBs to unlink: a host sending
+        /// CMD_UNLINKs while it reads nothing (`USBAudioServer`).
+        case tooManyUnansweredUnlinks
     }
 }
 

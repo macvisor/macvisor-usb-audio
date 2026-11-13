@@ -181,6 +181,29 @@ public final class USBAudioServer: @unchecked Sendable {
         /// channel other than the master, would otherwise go unseen.
         var saidStalled = false
 
+        /// The most RET_UNLINKs that may wait behind the pacers' queues at once (13 Nov 2026). Each is
+        /// a closure on those queues, and a host that sent CMD_UNLINKs for URBs it no longer had while
+        /// reading nothing grew them without bound (the first send blocks, the reader thread reads
+        /// on). A host unlinks only URBs it has outstanding, at most the pacers' `maxQueuedURBs` each
+        /// and a few being completed; usbip-win2 and vhci keep a few dozen in flight. Past this the
+        /// session ends.
+        static let mostPendingUnlinks = 1024
+        private let pendingLock = NSLock()
+        private var pendingUnlinks = 0
+
+        /// Counts a RET_UNLINK that waits behind the pacers; false (and nothing counted) past the most.
+        func unlinkReplyQueued() -> Bool {
+            pendingLock.withLock {
+                guard pendingUnlinks < Self.mostPendingUnlinks else { return false }
+                pendingUnlinks += 1
+                return true
+            }
+        }
+
+        func unlinkReplyDone() {
+            pendingLock.withLock { pendingUnlinks -= 1 }
+        }
+
         func send(_ data: Data) {
             writeLock.lock()
             defer { writeLock.unlock() }
@@ -295,9 +318,15 @@ public final class USBAudioServer: @unchecked Sendable {
                     // Completed, or completing in a pacer's job right now, whose RET_SUBMIT may not
                     // be out yet: the answer goes through both pacers' queues, after any job that
                     // runs (5 Nov 2026).
+                    // Counted until it is written: a host that sends these and reads nothing ends
+                    // its session rather than growing the queues (`mostPendingUnlinks`).
+                    guard s.unlinkReplyQueued() else { throw USBIP.ProtocolError.tooManyUnansweredUnlinks }
                     let reply = USBIP.encodeUnlinkReply(sequence: u.sequence, status: USBIP.Status.ok)
                     s.playbackPacer.afterRunningJob {
-                        s.capturePacer.afterRunningJob { s.send(reply) }
+                        s.capturePacer.afterRunningJob {
+                            s.send(reply)
+                            s.unlinkReplyDone()
+                        }
                     }
                 }
             }
